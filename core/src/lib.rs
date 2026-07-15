@@ -1,5 +1,7 @@
 use wasm_bindgen::prelude::*;
 
+pub mod signer;
+
 /// Returns the core crate version.
 #[wasm_bindgen]
 pub fn version() -> String {
