@@ -1,17 +1,41 @@
 <script lang="ts">
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
-  import { buildTree } from "../lib/listing";
+  import { buildTree, formatSize, totalSize } from "../lib/listing";
   import SidebarNode from "./SidebarNode.svelte";
 
-  const tree = $derived(buildTree(session.manifest?.objects ?? []));
+  const objects = $derived(session.manifest?.objects ?? []);
+  const tree = $derived(buildTree(objects));
 </script>
 
 <nav>
+  <input
+    class="search"
+    type="search"
+    placeholder="Search files…"
+    value={browse.searchQuery}
+    oninput={(e) => browse.setSearch(e.currentTarget.value)}
+  />
   <ul class="views">
     <li>
-      <button class:active={browse.prefix === ""} onclick={() => browse.navigate("")}>
+      <button class:active={browse.section === "all"} onclick={() => browse.navigate("")}>
         📁 All files
+      </button>
+    </li>
+    <li>
+      <button
+        class:active={browse.section === "recent"}
+        onclick={() => browse.setSection("recent")}
+      >
+        🕓 Recent
+      </button>
+    </li>
+    <li>
+      <button
+        class:active={browse.section === "favorites"}
+        onclick={() => browse.setSection("favorites")}
+      >
+        ⭐ Favorites
       </button>
     </li>
   </ul>
@@ -21,6 +45,7 @@
       <SidebarNode {node} />
     {/each}
   </ul>
+  <div class="storage">◔ {formatSize(totalSize(objects))} used</div>
 </nav>
 
 <style>
@@ -39,6 +64,19 @@
     list-style: none;
     margin: 0;
     padding: 0;
+  }
+  .search {
+    background: var(--input-bg);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-small);
+    color: var(--text-bright);
+    padding: 6px 10px;
+    font: inherit;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .search:focus {
+    outline: 1px solid var(--accent);
   }
   .views button {
     width: 100%;
@@ -65,5 +103,11 @@
   }
   .tree {
     flex: 1;
+  }
+  .storage {
+    font-size: 11px;
+    color: var(--text-dim);
+    border-top: 1px solid var(--border);
+    padding: 10px 10px 0;
   }
 </style>
