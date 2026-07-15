@@ -116,4 +116,29 @@ describe("uploadThumb", () => {
     await expect(uploadThumb(client as unknown as WasmClient, "photo.png", blob)).rejects.toThrow("403");
     expect(client.set_thumbnail).not.toHaveBeenCalled();
   });
+
+  it("PUTs with the blob's OWN type (not the hardcoded webp constant) and warns once when they differ", async () => {
+    const client = fakeClient({});
+    const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Simulates a `canvas.toBlob("image/webp", …)` silent fallback to PNG on
+    // an engine without a WebP encoder — the .webp key suffix is unaffected.
+    const blob = new Blob(["fake-png-bytes"], { type: "image/png" });
+
+    const result = await uploadThumb(client as unknown as WasmClient, "photos/cat.png", blob);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://example.test/thumb-put",
+      expect.objectContaining({
+        method: "PUT",
+        headers: { "Content-Type": "image/png" },
+        body: blob,
+      }),
+    );
+    expect(client.presign_put).toHaveBeenCalledWith(".bare-bucket/thumbs/photos/cat.png.webp", expect.any(Number));
+    expect(result.thumbnailKey).toBe(".bare-bucket/thumbs/photos/cat.png.webp");
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/image\/png/);
+  });
 });

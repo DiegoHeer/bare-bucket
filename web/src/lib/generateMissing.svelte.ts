@@ -81,6 +81,15 @@ export const generateMissing: {
    * do (in which case `total` stays 0 so the UI shows no stray summary). */
   async start(client, manifest) {
     if (generateMissing.running) return;
+    // `inFlightKeys` is a snapshot taken once, here, at scan time — not
+    // re-read as the run progresses. This is a deliberate, self-healing
+    // race, not an oversight: if a key starts an upload mid-run (after this
+    // snapshot), that upload's own on-upload hook sets its thumbnail via the
+    // same idempotent `set_thumbnail` this runner uses, so there's no
+    // duplicate-work hazard; and if a key's in-flight transfer completes and
+    // it grows a thumbnail after being excluded here, a later `reconcile`
+    // pass — not this runner — sweeps any orphaned thumb objects it left
+    // behind. See missingThumbCandidates' own doc comment for the filter.
     const inFlightKeys = keysInStatus(transfers.items, [
       "queued",
       "uploading",

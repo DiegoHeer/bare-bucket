@@ -78,7 +78,11 @@ async function bitmapViaImgElement(blob: Blob): Promise<ImageBitmap> {
 export async function generateImageThumb(blob: Blob): Promise<Blob> {
   let bitmap: ImageBitmap;
   try {
-    bitmap = await createImageBitmap(blob);
+    // `imageOrientation: "from-image"` — createImageBitmap's own default is
+    // "none" (ignore EXIF), which would thumb EXIF-rotated photos sideways;
+    // `<img>` decoding (the fallback below) already auto-applies EXIF per the
+    // HTML spec, so this option only matters on this direct-from-Blob path.
+    bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
   } catch {
     bitmap = await bitmapViaImgElement(blob);
   }
@@ -155,10 +159,10 @@ export async function generateThumbFor(kind: "image" | "pdf", source: ThumbSourc
   }
 }
 
-async function putThumbBlob(url: string, blob: Blob): Promise<void> {
+async function putThumbBlob(url: string, blob: Blob, contentType: string): Promise<void> {
   const response = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": THUMB_CONTENT_TYPE },
+    headers: { "Content-Type": contentType },
     body: blob,
   });
   if (!response.ok) {
@@ -177,13 +181,31 @@ export interface UploadThumbResult {
 /**
  * Uploads `blob` as `key`'s thumbnail [B3]: derives the thumb key via the
  * SAME `thumbnail_key_for` shape core uses (no separately-invented key
- * layout), presigns a PUT for it, PUTs with `Content-Type: image/webp`, then
- * calls `set_thumbnail` to record it in the manifest.
+ * layout), presigns a PUT for it, PUTs with `blob`'s OWN `type` as the
+ * `Content-Type` (see below), then calls `set_thumbnail` to record it in the
+ * manifest.
+ *
+ * `canvas.toBlob("image/webp", …)` silently falls back to PNG bytes on
+ * engines lacking a WebP encoder — it never rejects. Trusting the requested
+ * `THUMB_CONTENT_TYPE` in that case would PUT PNG bytes under a `.webp`-
+ * suffixed key with an `image/webp` header, which is wrong even though it
+ * happens to render (browsers byte-sniff `<img>` content over trusting the
+ * extension/header). So the PUT's `Content-Type` is threaded from the blob's
+ * ACTUAL `type` rather than hardcoded; the `.webp` key suffix stays as-is
+ * per the manifest's key-layout contract regardless of the real encoding.
  */
 export async function uploadThumb(client: WasmClient, key: string, blob: Blob): Promise<UploadThumbResult> {
   const thumbnailKey = client.thumbnail_key_for(key);
   const presigned = client.presign_put(thumbnailKey, PRESIGN_EXPIRES_SECS) as PresignedRequest;
-  await putThumbBlob(presigned.url, blob);
+  const contentType = blob.type || THUMB_CONTENT_TYPE;
+  if (contentType !== THUMB_CONTENT_TYPE) {
+    console.warn(
+      `thumbnail for "${key}" was encoded as "${contentType}", not ${THUMB_CONTENT_TYPE} ` +
+        `(engine likely lacks a WebP encoder) — uploading the actual bytes/type under the ` +
+        `.webp-suffixed key anyway; browsers byte-sniff image content so it still renders.`,
+    );
+  }
+  await putThumbBlob(presigned.url, blob, contentType);
   const report = (await client.set_thumbnail(key, thumbnailKey)) as SetThumbnailReport;
   return { thumbnailKey, updated: report.updated };
 }
