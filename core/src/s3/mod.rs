@@ -27,13 +27,13 @@ pub struct S3Config {
     pub credentials: Credentials,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GetResult {
     pub bytes: Vec<u8>,
     pub etag: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PutResult {
     pub etag: String,
 }
@@ -63,10 +63,33 @@ impl S3Client {
                 config.endpoint
             )));
         }
+        let scheme = scheme.to_lowercase();
+        let authority = normalize_authority(authority, &scheme);
+
+        // A signed client must never follow redirects: reqwest's redirect
+        // handling strips the Authorization header on host change, and even
+        // a same-host redirect would break signed-host/wire-host parity.
+        // Browser fetch's own redirect policy applies on wasm, where we have
+        // no client-level control over it.
+        //
+        // Deliberate deviation from the plan's YAGNI list (adopted per final
+        // review): a 30s total request timeout. All send() bodies here are
+        // small control-plane payloads (manifest, thumbnails, list XML — at
+        // most ~300 KB), so a generous fixed timeout is safe and prevents a
+        // wedged connection from hanging a caller indefinitely.
+        #[cfg(not(target_arch = "wasm32"))]
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| S3Error::Config(format!("http client: {e}")))?;
+        #[cfg(target_arch = "wasm32")]
+        let http = reqwest::Client::new();
+
         Ok(S3Client {
-            scheme: scheme.to_string(),
-            authority: authority.to_string(),
-            http: reqwest::Client::new(),
+            scheme,
+            authority,
+            http,
             max_retries: 3,
             config,
         })
@@ -239,8 +262,11 @@ impl S3Client {
     }
 
     /// PUT an object. `if_match` adds a conditional write on the current
-    /// ETag (manifest conflict handling, spec §4.2); providers that ignore
-    /// it degrade to last-writer-wins.
+    /// ETag (manifest conflict handling, spec §4.2). Providers vary in how
+    /// they handle If-Match: some silently ignore it and degrade to
+    /// last-writer-wins, while others reject it outright, surfacing
+    /// `S3Error::Unsupported` (HTTP 501) so the caller can choose a
+    /// deliberate fallback instead of assuming atomicity it doesn't have.
     pub async fn put_object(
         &self,
         key: &str,
@@ -275,8 +301,30 @@ async fn sleep_ms(ms: u64) {
 }
 
 fn backoff_ms(attempt: u32) -> u64 {
+    debug_assert!(attempt >= 1);
     // 200ms, 800ms, 3200ms
-    200 * 4u64.pow(attempt - 1)
+    200 * 4u64.pow(attempt.saturating_sub(1))
+}
+
+/// Lowercase the authority and strip a default port matching the scheme, so
+/// the signed host always matches the wire host. The `url` crate normalizes
+/// both of these at parse time (RFC 3986 host case-insensitivity, RFC 3986
+/// §6.2.3 default-port equivalence); without matching that here, a signed
+/// request against e.g. `S3.Example.com:443` would sign one host but reqwest
+/// would send another, producing `SignatureDoesNotMatch`.
+fn normalize_authority(authority: &str, scheme: &str) -> String {
+    let lower = authority.to_lowercase();
+    let default_port = match scheme {
+        "https" => Some(":443"),
+        "http" => Some(":80"),
+        _ => None,
+    };
+    if let Some(port) = default_port {
+        if let Some(stripped) = lower.strip_suffix(port) {
+            return stripped.to_string();
+        }
+    }
+    lower
 }
 
 fn classify(status: u16, key: Option<&str>, body: String) -> S3Error {
@@ -287,11 +335,15 @@ fn classify(status: u16, key: Option<&str>, body: String) -> S3Error {
         },
         412 => S3Error::PreconditionFailed,
         403 => S3Error::AccessDenied { message },
-        429 | 500..=599 => S3Error::Provider {
+        408 | 429 | 500 | 502 | 503 | 504 => S3Error::Provider {
             status,
             message,
             retryable: true,
         },
+        // Not Implemented: the provider doesn't support this operation (e.g.
+        // conditional writes). The manifest layer (PR 5) detects this to
+        // choose its fallback deliberately, rather than retrying forever.
+        501 => S3Error::Unsupported { message },
         _ => S3Error::Provider {
             status,
             message,
@@ -384,9 +436,38 @@ mod tests {
         // reqwest parses the URL string; if the url crate normalized our
         // percent-encoding the wire path would diverge from the signed path.
         let client = S3Client::new(config(true)).unwrap();
-        let t = client.target(Some("photos/2026/IMG 0001.jpg"), &[]);
+        let t = client.target(Some("photos/2026/IMG 0001.jpg"), &[("prefix", "a b")]);
         let parsed = reqwest::Url::parse(&t.url).unwrap();
         assert_eq!(parsed.path(), t.uri_path);
+        let expected_query = t.url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        assert_eq!(parsed.query().unwrap_or(""), expected_query);
+    }
+
+    #[test]
+    fn endpoint_authority_is_lowercased_and_default_port_stripped() {
+        let mut cfg = config(true);
+        cfg.endpoint = "https://S3.Example.com:443".to_string();
+        let client = S3Client::new(cfg).unwrap();
+        let t = client.target(None, &[]);
+        assert_eq!(t.host, "s3.example.com");
+    }
+
+    #[test]
+    fn endpoint_default_http_port_is_stripped() {
+        let mut cfg = config(true);
+        cfg.endpoint = "http://minio.lan:80".to_string();
+        let client = S3Client::new(cfg).unwrap();
+        let t = client.target(None, &[]);
+        assert_eq!(t.host, "minio.lan");
+    }
+
+    #[test]
+    fn endpoint_non_default_port_is_kept() {
+        let mut cfg = config(true);
+        cfg.endpoint = "http://minio.lan:9000".to_string();
+        let client = S3Client::new(cfg).unwrap();
+        let t = client.target(None, &[]);
+        assert_eq!(t.host, "minio.lan:9000");
     }
 
     #[test]
@@ -409,5 +490,18 @@ mod tests {
         .is_retryable());
         assert!(!S3Error::NotFound { key: "k".into() }.is_retryable());
         assert!(!S3Error::PreconditionFailed.is_retryable());
+    }
+
+    #[test]
+    fn classify_maps_501_to_unsupported_and_not_retryable() {
+        let err = classify(501, None, String::new());
+        assert!(matches!(err, S3Error::Unsupported { .. }));
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn classify_502_is_retryable_505_is_not() {
+        assert!(classify(502, None, String::new()).is_retryable());
+        assert!(!classify(505, None, String::new()).is_retryable());
     }
 }

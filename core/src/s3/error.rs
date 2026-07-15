@@ -22,6 +22,8 @@ pub enum S3Error {
     Network(String),
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    #[error("not supported by provider: {message}")]
+    Unsupported { message: String },
 }
 
 impl S3Error {

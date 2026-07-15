@@ -2,6 +2,7 @@
 
 use super::S3Error;
 
+#[derive(Debug, Clone)]
 pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
@@ -10,6 +11,7 @@ pub struct ObjectInfo {
     pub last_modified: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct ListPage {
     pub objects: Vec<ObjectInfo>,
     pub next_continuation_token: Option<String>,
@@ -17,10 +19,10 @@ pub struct ListPage {
 }
 
 pub fn parse_list_response(xml: &[u8]) -> Result<ListPage, S3Error> {
-    let xml_string = String::from_utf8(xml.to_vec())
+    let xml_string = std::str::from_utf8(xml)
         .map_err(|e| S3Error::InvalidResponse(format!("invalid UTF-8: {e}")))?;
 
-    let doc = roxmltree::Document::parse(&xml_string)
+    let doc = roxmltree::Document::parse(xml_string)
         .map_err(|e| S3Error::InvalidResponse(format!("XML parse error: {e}")))?;
 
     let root = doc.root_element();
