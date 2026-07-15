@@ -34,6 +34,12 @@ interface InternalState {
   completedBytes: number;
   controllers: Set<AbortController>;
   inFlightLoaded: Map<AbortController, number>;
+  /** True while `processFile` is on the stack for this transfer (from entry
+   * until its `finally` clears it, right before that `finally` calls
+   * `pump()`). Lets `pump()` refuse to dispatch a second, concurrent
+   * `runMultipart`/`runSingle` for the same transfer while an earlier one is
+   * still unwinding after a pause/resume race. */
+  running: boolean;
   /** Set by pause(); the part-dispatch loop stops picking up new parts but
    * lets in-flight parts finish (and count) — see brief's engine algorithm. */
   paused: boolean;
@@ -285,7 +291,15 @@ async function runMultipart(
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   // cancel()/pause() already set the row's status themselves; just stop.
-  if (internal.cancelled || internal.paused) return;
+  // A resume that lands mid-unwind (before this instance's `finally` clears
+  // `running`) re-queues the transfer — `transfer.status` flips back to
+  // "queued" while this stale instance is still on the stack. That instance
+  // must not complete or error the transfer; the scheduler will re-dispatch
+  // a fresh run once `running` clears. This also covers the `failure`
+  // branch below: the gate returns first, so a re-pushed part with
+  // `failure` set never gets a chance to flip a re-queued transfer to
+  // "error".
+  if (internal.cancelled || internal.paused || transfer.status === "queued") return;
 
   if (failure) {
     transfer.status = "error";
@@ -311,10 +325,12 @@ async function runMultipart(
 
 async function processFile(transfer: Transfer, internal: InternalState): Promise<void> {
   transfer.status = "uploading";
+  internal.running = true;
   const client = session.client;
   if (!client) {
     transfer.status = "error";
     transfer.error = "not connected";
+    internal.running = false;
     pump();
     return;
   }
@@ -325,6 +341,7 @@ async function processFile(transfer: Transfer, internal: InternalState): Promise
       await runMultipart(client, transfer, internal);
     }
   } finally {
+    internal.running = false; // must clear before pump() re-dispatches, else pump would see this run as still active
     pump();
   }
 }
@@ -341,6 +358,7 @@ function pump(): void {
     if (transfer.status !== "queued") continue;
     const internal = internals.get(transfer.id);
     if (!internal) continue;
+    if (internal.running) continue; // the previous run is still unwinding; its finally will re-pump
     free--;
     void processFile(transfer, internal);
   }
@@ -407,6 +425,7 @@ export const transfers: {
       completedBytes: 0,
       controllers: new Set(),
       inFlightLoaded: new Map(),
+      running: false,
       paused: false,
       cancelled: false,
       completing: false,
@@ -416,6 +435,10 @@ export const transfers: {
     pump();
   },
 
+  /** Pause aborts in-flight part requests; interrupted parts return to the
+   * queue and re-upload on resume. Progress may visibly drop slightly when
+   * pausing (the in-flight parts' loaded-but-uncommitted bytes are
+   * discarded along with the abort) — that's expected. */
   pause(id: string) {
     const transfer = transfers.items.find((t) => t.id === id);
     const internal = internals.get(id);
@@ -424,6 +447,7 @@ export const transfers: {
     if (transfer.kind !== "multipart" || transfer.status !== "uploading") return;
     internal.paused = true;
     transfer.status = "paused";
+    for (const controller of internal.controllers) controller.abort();
     pump(); // frees this file's concurrency slot for the next queued upload
   },
 
