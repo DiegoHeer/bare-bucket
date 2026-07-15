@@ -10,9 +10,11 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 
-use crate::manifest::{now_iso8601, ManifestObject, ManifestStore};
+use crate::manifest::{now_iso8601, ManifestObject, ManifestStore, RESERVED_PREFIX};
 use crate::reconcile::{reconcile, ReconcileOptions};
-use crate::s3::{plan_upload, HeadResult, PresignedRequest, S3Client, S3Config, UploadPlan};
+use crate::s3::{
+    plan_upload, HeadResult, PresignedRequest, S3Client, S3Config, S3Error, UploadPlan,
+};
 use crate::signer::Credentials;
 
 #[derive(serde::Deserialize)]
@@ -314,6 +316,67 @@ impl WasmClient {
             .map_err(js_error)?;
         Ok(())
     }
+
+    /// Permanently delete an object (spec §7.6): S3 `DELETE` object, a
+    /// best-effort S3 `DELETE` of its thumbnail, then a manifest tombstone.
+    /// Holds the manifest writer lock (see module docs) for the WHOLE
+    /// sequence [B1][B3] — reconcile or another mutation must not interleave
+    /// with this multi-step composite, since the thumbnail key it acts on is
+    /// read from the manifest before either S3 delete runs.
+    ///
+    /// Order per [B3]: object DELETE (`NotFound` counts as success — delete
+    /// is idempotent) → thumbnail DELETE, if the row had one, best-effort
+    /// (a failure does NOT abort the flow; it is reported as
+    /// `thumbnail_deleted: false` and reconcile's orphan-thumb sweep heals
+    /// it later) → manifest tombstone write, skipped entirely when there is
+    /// nothing to change (unknown key or a row that is already tombstoned).
+    /// A non-`NotFound` object-delete error aborts the method before any
+    /// tombstone write happens.
+    pub async fn delete_object(&self, key: String) -> Result<JsValue, JsError> {
+        // Reserved-prefix rejection happens before any network call.
+        if key.starts_with(RESERVED_PREFIX) {
+            return Err(JsError::new(&format!("cannot delete reserved key: {key}")));
+        }
+
+        let _write = self.inner.manifest_write_lock.lock().await;
+        let store = ManifestStore::new(&self.inner.client, &self.inner.device_id);
+
+        // The thumbnail key must be read before either S3 delete runs (it
+        // does not change independently of this flow while the lock is
+        // held).
+        let loaded = store.load().await.map_err(js_error)?;
+        let thumbnail_key = loaded
+            .manifest
+            .get(&key)
+            .and_then(|o| o.thumbnail_key.clone());
+
+        match self.inner.client.delete_object(&key).await {
+            Ok(()) | Err(S3Error::NotFound { .. }) => {}
+            Err(e) => return Err(js_error(e)),
+        }
+
+        let thumbnail_deleted = match &thumbnail_key {
+            Some(thumb_key) => Some(matches!(
+                self.inner.client.delete_object(thumb_key).await,
+                Ok(()) | Err(S3Error::NotFound { .. })
+            )),
+            None => None,
+        };
+
+        // Computed once, outside the closure: see update_with_retry docs —
+        // the mutator may run multiple times across conflict retries.
+        let deleted_at = now_iso8601();
+        let outcome = store
+            .update_with_retry_if_changed(|m| m.mark_deleted(&key, &deleted_at))
+            .await
+            .map_err(js_error)?;
+
+        to_js(&DeleteReport {
+            deleted: true,
+            thumbnail_deleted,
+            already_absent: outcome.is_none(),
+        })
+    }
 }
 
 /// Strips characters that would let a display name break out of the
@@ -387,6 +450,17 @@ impl From<&HeadResult> for SerializableHeadResult {
             size: result.size,
         }
     }
+}
+
+/// Report for [`WasmClient::delete_object`] (spec §7.6, [B5]). Field names
+/// cross verbatim (snake_case), matching every other report struct in this
+/// module — there is no camelCase rename on the output side, only on
+/// [`JsConfig`]'s input struct.
+#[derive(serde::Serialize)]
+struct DeleteReport {
+    deleted: bool,
+    thumbnail_deleted: Option<bool>,
+    already_absent: bool,
 }
 
 /// ReconcileReport mirror with serde derive (the core struct deliberately
