@@ -142,6 +142,31 @@ function fakeWritable(): FakeWritable {
   };
 }
 
+interface WriteCall {
+  chunk: Uint8Array;
+  deferred: Deferred<void>;
+}
+
+/** A `writable.write()` stand-in whose calls hand back a controllable
+ * `deferred`, mirroring `fakeReader`/`fakePutWithProgress` — lets a test pin
+ * the exact moment a write is still in-flight (e.g. to race a cancel against
+ * it) instead of racing real I/O timing. */
+function fakeControllableWritable(): {
+  writable: FakeWritable;
+  calls: WriteCall[];
+} {
+  const calls: WriteCall[] = [];
+  const write = vi.fn((chunk: Uint8Array) => {
+    const deferred = defer<void>();
+    calls.push({ chunk, deferred });
+    return deferred.promise;
+  });
+  return {
+    writable: { write, close: vi.fn(async () => undefined), abort: vi.fn(async () => undefined) },
+    calls,
+  };
+}
+
 /** Drains the current microtask queue — enough ticks for any chain of
  * plain (non-timer) `await`s in the engine to settle. */
 async function flush(ticks = 8): Promise<void> {
@@ -391,6 +416,74 @@ describe("transfers engine", () => {
     expect(writable.abort).toHaveBeenCalledTimes(1);
     expect(writable.write).not.toHaveBeenCalled();
     expect(writable.close).not.toHaveBeenCalled();
+  });
+
+  it("cancel while a write() is in-flight aborts the fetch, settles cancelled, and the write settling afterward doesn't double-abort or close", async () => {
+    engineDeps.presignGet = vi.fn(async () => presignedGet("https://example.test/get"));
+    const reader = fakeReader();
+    let capturedSignal: AbortSignal | undefined;
+    engineDeps.fetchStream = vi.fn(async (_url: string, signal: AbortSignal) => {
+      capturedSignal = signal;
+      return fakeResponse(true, 200, reader.reader);
+    });
+    const { writable, calls: writeCalls } = fakeControllableWritable();
+
+    transfers.enqueueDownload("clip.mp4", "clip.mp4", 10, writable as unknown as FileSystemWritableFileStream);
+    await flush();
+
+    reader.calls[0].deferred.resolve({ done: false, value: new Uint8Array([1, 2, 3]) });
+    await flush();
+    const transfer = transfers.items[0];
+    expect(transfer.transferred).toBe(3);
+    expect(writeCalls).toHaveLength(1); // the reader loop is awaiting this write()
+
+    await transfers.cancel(transfer.id);
+
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(writable.abort).toHaveBeenCalledTimes(1);
+    expect(transfer.status).toBe("cancelled");
+    expect(writable.close).not.toHaveBeenCalled();
+
+    // The in-flight write() rejects only now, as a real aborted sink write
+    // would — the run's own catch must see `internal.cancelled` and no-op
+    // rather than double-aborting the writable, re-aborting the fetch, or
+    // clobbering the status.
+    writeCalls[0].deferred.reject(new DOMException("aborted", "AbortError"));
+    await flush();
+
+    expect(writable.abort).toHaveBeenCalledTimes(1);
+    expect(writable.close).not.toHaveBeenCalled();
+    expect(transfer.status).toBe("cancelled");
+  });
+
+  it("a write() failure errors the row, aborts the writable, and aborts the underlying fetch so no dangling reader survives", async () => {
+    engineDeps.presignGet = vi.fn(async () => presignedGet("https://example.test/get"));
+    const reader = fakeReader();
+    let capturedSignal: AbortSignal | undefined;
+    engineDeps.fetchStream = vi.fn(async (_url: string, signal: AbortSignal) => {
+      capturedSignal = signal;
+      return fakeResponse(true, 200, reader.reader);
+    });
+    const writable = fakeWritable();
+    writable.write.mockImplementation(async () => {
+      throw new Error("disk full");
+    });
+
+    transfers.enqueueDownload("clip.mp4", "clip.mp4", 10, writable as unknown as FileSystemWritableFileStream);
+    await flush();
+
+    reader.calls[0].deferred.resolve({ done: false, value: new Uint8Array([1, 2, 3]) });
+    await flush();
+
+    const transfer = transfers.items[0];
+    expect(transfer.status).toBe("error");
+    expect(transfer.error).toContain("disk full");
+    expect(writable.abort).toHaveBeenCalledTimes(1);
+    expect(writable.close).not.toHaveBeenCalled();
+    // This is the one that fails without the fix: without aborting the
+    // fetch controller in runDownload's catch, the browser is left pulling
+    // response bytes into an abandoned reader.
+    expect(capturedSignal?.aborted).toBe(true);
   });
 
   it("a download queues behind 3 active uploads and dispatches once a slot frees", async () => {

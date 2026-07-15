@@ -423,18 +423,19 @@ async function runDownload(transfer: Transfer, internal: InternalState): Promise
     if (!response.ok || !response.body) {
       throw new Error(`download failed with status ${response.status}`);
     }
+    const writable = internal.writable!; // set at enqueueDownload(), only nulled after this transfer is terminal; captured once here (mirrors how the upload engine captures `internal.file` per attempt) so a chunk landing after a cancel can't dereference a nulled field
     const reader = response.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (value) {
         transfer.transferred += value.byteLength;
-        await internal.writable!.write(value); // set at enqueueDownload(), only nulled after this transfer is terminal
+        await writable.write(value);
       }
     }
     internal.controllers.delete(controller);
     if (internal.cancelled) return; // cancel() already aborted the writable; close() must never follow an abort()
-    await internal.writable!.close();
+    await writable.close();
     // As with the upload path, assert the full byte count explicitly rather
     // than trusting the last chunk to land exactly on `transfer.size`.
     transfer.transferred = transfer.size;
@@ -442,9 +443,15 @@ async function runDownload(transfer: Transfer, internal: InternalState): Promise
     freeInternal(transfer.id);
   } catch (e) {
     internal.controllers.delete(controller);
-    if (internal.cancelled) return; // cancel() already set status "cancelled" and aborted the writable itself
+    if (internal.cancelled) return; // cancel() already set status "cancelled", aborted the writable, and aborted the fetch controller itself
     transfer.status = "error";
     transfer.error = errMsg(e);
+    // A write failure or a non-OK response means the response body (if any)
+    // was never fully consumed — abort the fetch too, or the browser is left
+    // pulling bytes into a reader nobody's reading from anymore. Aborting an
+    // already-settled/never-started fetch is a harmless no-op, so this is
+    // safe to call unconditionally on this (non-cancel) branch.
+    controller.abort();
     try {
       await internal.writable?.abort();
     } catch {
