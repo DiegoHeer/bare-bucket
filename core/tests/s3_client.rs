@@ -322,3 +322,27 @@ async fn abort_multipart_upload_deletes_with_upload_id() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn list_multipart_uploads_hits_bucket_root_with_uploads_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListMultipartUploadsResult>
+  <IsTruncated>false</IsTruncated>
+  <Upload>
+    <Key>big.bin</Key><UploadId>uid-1</UploadId>
+    <Initiated>2026-07-15T10:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let uploads = client_for(&server).list_multipart_uploads().await.unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].key, "big.bin");
+    assert_eq!(uploads[0].upload_id, "uid-1");
+}

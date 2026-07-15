@@ -674,4 +674,41 @@ mod tests {
         assert_eq!(next_key_marker.as_deref(), Some("big.bin"));
         assert_eq!(next_upload_id_marker.as_deref(), Some("uid-1"));
     }
+
+    #[test]
+    fn parses_namespaced_list_multipart_uploads() {
+        let xml = r#"<?xml version="1.0"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>photos</Bucket>
+  <IsTruncated>false</IsTruncated>
+  <Upload>
+    <Key>big.bin</Key><UploadId>ns-uid-1</UploadId>
+    <Initiated>2026-07-15T10:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#;
+        let (uploads, is_truncated, ..) = parse_list_uploads_page(xml.as_bytes()).unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].key, "big.bin");
+        assert_eq!(uploads[0].upload_id, "ns-uid-1");
+        assert!(!is_truncated);
+    }
+
+    #[test]
+    fn upload_with_empty_key_is_excluded() {
+        let xml = r#"<?xml version="1.0"?>
+<ListMultipartUploadsResult>
+  <Upload>
+    <Key></Key><UploadId>uid-bad</UploadId>
+    <Initiated>2026-07-15T10:00:00.000Z</Initiated>
+  </Upload>
+  <Upload>
+    <Key>good.bin</Key><UploadId>uid-good</UploadId>
+    <Initiated>2026-07-15T11:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#;
+        let (uploads, ..) = parse_list_uploads_page(xml.as_bytes()).unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].key, "good.bin");
+        assert_eq!(uploads[0].upload_id, "uid-good");
+    }
 }
