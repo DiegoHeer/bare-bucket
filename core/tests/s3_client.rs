@@ -226,3 +226,86 @@ async fn list_all_follows_continuation_tokens() {
     assert_eq!(objects[0].key, "a.txt");
     assert_eq!(objects[1].key, "b.txt");
 }
+
+#[tokio::test]
+async fn create_multipart_upload_posts_and_parses_upload_id() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/test-bucket/big.bin"))
+        .and(query_param("uploads", ""))
+        .and(header("content-type", "video/mp4"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<InitiateMultipartUploadResult><UploadId>uid-1</UploadId></InitiateMultipartUploadResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let upload_id = client_for(&server)
+        .create_multipart_upload("big.bin", "video/mp4")
+        .await
+        .unwrap();
+    assert_eq!(upload_id, "uid-1");
+}
+
+#[tokio::test]
+async fn complete_multipart_upload_sends_xml_and_parses_etag() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/test-bucket/big.bin"))
+        .and(query_param("uploadId", "uid-1"))
+        .and(body_bytes(
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;e1&quot;</ETag></Part></CompleteMultipartUpload>".to_vec(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<CompleteMultipartUploadResult><ETag>"combined"</ETag></CompleteMultipartUploadResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let etag = client_for(&server)
+        .complete_multipart_upload("big.bin", "uid-1", &[(1, "\"e1\"".to_string())])
+        .await
+        .unwrap();
+    assert_eq!(etag, "\"combined\"");
+}
+
+#[tokio::test]
+async fn complete_multipart_upload_detects_200_error_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                r#"<Error><Code>InternalError</Code><Message>boom</Message></Error>"#,
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client_for(&server)
+        .complete_multipart_upload("big.bin", "uid-1", &[(1, "\"e1\"".to_string())])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("InternalError"));
+}
+
+#[tokio::test]
+async fn abort_multipart_upload_deletes_with_upload_id() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/test-bucket/big.bin"))
+        .and(query_param("uploadId", "uid-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    client_for(&server)
+        .abort_multipart_upload("big.bin", "uid-1")
+        .await
+        .unwrap();
+}
