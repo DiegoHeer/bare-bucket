@@ -1,9 +1,9 @@
 //! Wiremock tests of the reconcile orchestrator: partitioning, cleanups,
 //! manifest write, and corrupt-manifest recovery.
 
-use bare_bucket_core::manifest::{thumbnail_key_for, Manifest, ManifestObject};
+use bare_bucket_core::manifest::{thumbnail_key_for, Manifest, ManifestError, ManifestObject};
 use bare_bucket_core::reconcile::{reconcile, ReconcileOptions, ReconcileReport};
-use bare_bucket_core::s3::{S3Client, S3Config};
+use bare_bucket_core::s3::{S3Client, S3Config, S3Error};
 use bare_bucket_core::signer::Credentials;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -279,4 +279,148 @@ async fn existing_manifest_write_is_conditional() {
         .unwrap();
     assert_eq!(report.added, 1);
     assert!(report.conditional);
+}
+
+#[tokio::test]
+async fn corrupt_recovery_conflict_retries_whole_reconcile_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("list-type", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(list_xml(&[(
+            "photos/a.jpg",
+            10,
+            "\"e1\"",
+        )])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_uploads_xml()))
+        .mount(&server)
+        .await;
+
+    // First pass: manifest GET returns garbage at etag "c1" — but only once.
+    Mock::given(method("GET"))
+        .and(path(MANIFEST_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"garbage".to_vec())
+                .insert_header("etag", "\"c1\""),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // First recovery PUT (conditional on "c1") conflicts.
+    Mock::given(method("PUT"))
+        .and(path(MANIFEST_PATH))
+        .and(wiremock::matchers::header("if-match", "\"c1\""))
+        .respond_with(ResponseTemplate::new(412))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Retry pass: manifest is now valid at etag "v2".
+    Mock::given(method("GET"))
+        .and(path(MANIFEST_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(Manifest::empty().to_gzipped_json())
+                .insert_header("etag", "\"v2\""),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(MANIFEST_PATH))
+        .and(wiremock::matchers::header("if-match", "\"v2\""))
+        .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"m9\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let report = reconcile(&client, "web-test", &ReconcileOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report.added, 1, "retry pass rebuilds from the same LIST");
+    assert!(
+        report.conditional,
+        "retry pass still writes conditionally against the valid etag"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_recovery_conflict_twice_propagates() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("list-type", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(list_xml(&[(
+            "photos/a.jpg",
+            10,
+            "\"e1\"",
+        )])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_uploads_xml()))
+        .mount(&server)
+        .await;
+    // Manifest is always corrupt, always at etag "c1".
+    Mock::given(method("GET"))
+        .and(path(MANIFEST_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"garbage".to_vec())
+                .insert_header("etag", "\"c1\""),
+        )
+        .mount(&server)
+        .await;
+    // Every recovery PUT conflicts, both on the first pass and the retry.
+    Mock::given(method("PUT"))
+        .and(path(MANIFEST_PATH))
+        .respond_with(ResponseTemplate::new(412))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let err = reconcile(&client, "web-test", &ReconcileOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ManifestError::S3(S3Error::PreconditionFailed)),
+        "one retry is allowed; a second conflict propagates"
+    );
+}
+
+#[tokio::test]
+async fn unparseable_thumb_names_are_orphaned() {
+    let server = MockServer::start().await;
+    let odd_thumb = ".bare-bucket/thumbs/noext.png"; // no .webp suffix
+    mount_defaults(
+        &server,
+        list_xml(&[("photos/a.jpg", 10, "\"e1\""), (odd_thumb, 1, "\"t1\"")]),
+        empty_uploads_xml().to_string(),
+    )
+    .await;
+    let delete_path = format!("/test-bucket/{odd_thumb}");
+    Mock::given(method("DELETE"))
+        .and(path(delete_path.as_str()))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let report = reconcile(&client, "web-test", &ReconcileOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        report.thumbnails_deleted, 1,
+        "unparseable thumb name is treated as orphaned"
+    );
 }
