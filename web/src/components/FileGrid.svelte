@@ -1,9 +1,9 @@
 <script lang="ts">
   import type { ManifestObject } from "../lib/core";
   import type { Listing } from "../lib/listing";
-  import { iconFor } from "../lib/icons";
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
+  import GridThumb from "./GridThumb.svelte";
 
   let {
     listing,
@@ -70,7 +70,7 @@
            lightbox [B8]; the action buttons are absolutely-positioned
            siblings layered on top and keep working independently. -->
       <button class="open" onclick={() => onOpen(file)}>
-        <span class="thumb">{iconFor(file.content_type)}</span>
+        <GridThumb {file} />
         <span class="caption">{fileName(file.key)}</span>
       </button>
     </div>
