@@ -15,9 +15,20 @@ function storedView(): View {
 export const browse = $state({
   prefix: "",
   view: storedView() as View,
+  section: "all" as "all" | "recent" | "favorites" | "search",
+  searchQuery: "",
 
   navigate(prefix: string) {
     browse.prefix = prefix;
+    browse.section = "all";
+  },
+  setSection(section: "all" | "recent" | "favorites") {
+    browse.section = section;
+    if (section !== "all") browse.searchQuery = "";
+  },
+  setSearch(query: string) {
+    browse.searchQuery = query;
+    browse.section = query.trim() ? "search" : "all";
   },
   toggleView() {
     browse.view = browse.view === "list" ? "grid" : "list";
@@ -29,5 +40,7 @@ export const browse = $state({
   },
   reset() {
     browse.prefix = "";
+    browse.section = "all";
+    browse.searchQuery = "";
   },
 });

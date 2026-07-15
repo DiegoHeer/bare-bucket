@@ -16,6 +16,7 @@ interface Session {
   refresh(): Promise<void>;
   disconnect(): void;
   clearError(): void;
+  toggleFavorite(key: string): Promise<void>;
 }
 
 const DEVICE_ID_KEY = "bare-bucket/device-id";
@@ -128,5 +129,22 @@ export const session: Session = $state({
 
   clearError() {
     session.error = null;
+  },
+
+  /** Optimistic favorite toggle (spec §... ) — flips the local flag
+   * immediately for a snappy UI, then persists across the wasm boundary;
+   * reverts and surfaces `refreshError` on failure. */
+  async toggleFavorite(key: string) {
+    if (!session.client || !session.manifest) return;
+    const object = session.manifest.objects.find((o) => o.key === key);
+    if (!object) return;
+    const next = !object.favorite;
+    object.favorite = next; // optimistic
+    try {
+      await session.client.set_favorite(key, next);
+    } catch (e) {
+      object.favorite = !next; // revert
+      session.refreshError = describeError(e);
+    }
   },
 });
