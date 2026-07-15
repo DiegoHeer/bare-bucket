@@ -160,6 +160,49 @@ const reupsertedRow = afterReupsert.objects.find((o) => o.key === uploadKey);
 if (reupsertedRow.thumbnail_key !== null) throw new Error("thumbnail_key must be cleared when etag changes");
 console.log("upsert_object etag-change clears thumbnail_key: ok");
 
+// thumbnail_key_for: pure key-math getter must match the core key shape
+// ([B3]) so web never invents its own layout.
+const derivedThumbKey = client.thumbnail_key_for(uploadKey);
+if (derivedThumbKey !== `.bare-bucket/thumbs/${uploadKey}.webp`) {
+  throw new Error(`unexpected thumbnail_key_for shape: ${derivedThumbKey}`);
+}
+console.log("thumbnail_key_for: ok,", derivedThumbKey);
+
+// set_thumbnail roundtrip: set, persisted in load_manifest; identical repeat
+// call is a no-op (updated: false); clearing via null; absent key is a
+// no-op; reserved-prefix key throws before any network call.
+const setThumbReport = await client.set_thumbnail(uploadKey, derivedThumbKey);
+if (setThumbReport.updated !== true) throw new Error(`set_thumbnail did not report updated: ${JSON.stringify(setThumbReport)}`);
+const afterSetThumb = await client.load_manifest();
+const thumbedRow = afterSetThumb.objects.find((o) => o.key === uploadKey);
+if (thumbedRow?.thumbnail_key !== derivedThumbKey) throw new Error("set_thumbnail did not persist thumbnail_key");
+console.log("set_thumbnail set: ok");
+
+const noopThumbReport = await client.set_thumbnail(uploadKey, derivedThumbKey);
+if (noopThumbReport.updated !== false) throw new Error(`identical set_thumbnail call must report updated:false: ${JSON.stringify(noopThumbReport)}`);
+console.log("set_thumbnail identical no-op: ok");
+
+const clearThumbReport = await client.set_thumbnail(uploadKey, null);
+if (clearThumbReport.updated !== true) throw new Error(`clearing thumbnail_key must report updated:true: ${JSON.stringify(clearThumbReport)}`);
+const afterClearThumb = await client.load_manifest();
+if (afterClearThumb.objects.find((o) => o.key === uploadKey)?.thumbnail_key !== null) {
+  throw new Error("set_thumbnail(null) did not clear thumbnail_key");
+}
+console.log("set_thumbnail clear: ok");
+
+const absentThumbReport = await client.set_thumbnail("smoke/definitely-does-not-exist.txt", derivedThumbKey);
+if (absentThumbReport.updated !== false) throw new Error(`set_thumbnail on an absent key must report updated:false: ${JSON.stringify(absentThumbReport)}`);
+console.log("set_thumbnail absent key: ok");
+
+let reservedThumbThrew = false;
+try {
+  await client.set_thumbnail(".bare-bucket/manifest.json.gz", derivedThumbKey);
+} catch {
+  reservedThumbThrew = true;
+}
+if (!reservedThumbThrew) throw new Error("set_thumbnail on a reserved-prefix key must throw");
+console.log("set_thumbnail reserved-prefix rejection: ok");
+
 // delete_object: upload -> delete -> tombstone visible in load_manifest ->
 // reconcile keeps it consistent (delete already ran the tombstone write, so
 // reconcile should see no further changes to this row).
