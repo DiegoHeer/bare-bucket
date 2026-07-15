@@ -186,11 +186,16 @@ export const session: Session = $state({
    * ignored on input and recomputed here from any existing row, mirroring
    * `WasmClient::upsert_object`'s preservation rule (core/src/wasm_api.rs):
    * favorite always carries over; thumbnail_key carries over only when the
-   * existing row's etag matches the new one, else it's cleared. */
+   * existing row's etag matches the new one, else it's cleared. A
+   * tombstoned existing row (deleted_at !== null) is treated as absent —
+   * re-uploading over a deleted key is a fresh object, not a restore, so it
+   * must not inherit a stale favorite/thumbnail. Keep in sync with
+   * core/src/wasm_api.rs's upsert_object. */
   applyUpsert(object: ManifestObject) {
     if (!session.manifest) return;
     const objects = session.manifest.objects;
-    const existing = objects.find((o) => o.key === object.key);
+    const found = objects.find((o) => o.key === object.key);
+    const existing = found && found.deleted_at === null ? found : null;
     const merged: ManifestObject = {
       ...object,
       favorite: existing ? existing.favorite : false,

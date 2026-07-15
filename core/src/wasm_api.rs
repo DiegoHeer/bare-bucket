@@ -261,8 +261,15 @@ impl WasmClient {
         let last_modified = now_iso8601();
         store
             .update_with_retry(|m| {
+                // A tombstoned row (deleted_at set) is treated as absent for
+                // preservation purposes — re-uploading over a deleted key is
+                // a fresh object, not a restore, so it must not inherit a
+                // stale favorite flag or thumbnail from whatever used to
+                // live at that key.
+                // Mirrored in web/src/lib/session.svelte.ts applyUpsert —
+                // keep in sync.
                 let (favorite, thumbnail_key) = match m.get(&key) {
-                    Some(existing) => (
+                    Some(existing) if existing.deleted_at.is_none() => (
                         existing.favorite,
                         if existing.etag == etag {
                             existing.thumbnail_key.clone()
@@ -270,7 +277,7 @@ impl WasmClient {
                             None
                         },
                     ),
-                    None => (false, None),
+                    _ => (false, None),
                 };
                 m.upsert(ManifestObject {
                     key: key.clone(),
