@@ -1,5 +1,5 @@
 // App-level session state (Svelte 5 runes). One connection at a time.
-import { createClient, type Manifest, type WasmClient } from "./core";
+import { createClient, type Manifest, type ReconcileReport, type WasmClient } from "./core";
 import type { Profile } from "./profiles";
 
 interface Session {
@@ -9,8 +9,12 @@ interface Session {
   profileName: string;
   client: WasmClient | null;
   manifest: Manifest | null;
+  refreshing: boolean;
+  lastReport: ReconcileReport | null;
+  refreshError: string | null;
   connect(profile: Profile, secretAccessKey: string): Promise<void>;
   refreshManifest(): Promise<void>;
+  refresh(): Promise<void>;
   disconnect(): void;
   clearError(): void;
 }
@@ -49,6 +53,9 @@ export const session: Session = $state({
   profileName: "",
   client: null,
   manifest: null,
+  refreshing: false,
+  lastReport: null,
+  refreshError: null,
 
   async connect(profile: Profile, secretAccessKey: string) {
     if (session.connecting) return;
@@ -90,6 +97,24 @@ export const session: Session = $state({
     session.manifest = (await session.client.load_manifest()) as Manifest;
   },
 
+  /** Manual refresh (spec §6): reconciles remote changes, then reloads the
+   * manifest. Uses a dedicated `refreshError` (not `session.error`) so a
+   * failed refresh doesn't bounce the connected UI back to the connect
+   * screen's error handling. */
+  async refresh() {
+    if (!session.client || session.refreshing) return;
+    session.refreshing = true;
+    session.refreshError = null;
+    try {
+      session.lastReport = (await session.client.reconcile([])) as ReconcileReport;
+      session.manifest = (await session.client.load_manifest()) as Manifest;
+    } catch (e) {
+      session.refreshError = describeError(e);
+    } finally {
+      session.refreshing = false;
+    }
+  },
+
   disconnect() {
     try {
       session.client?.free();
@@ -101,6 +126,8 @@ export const session: Session = $state({
     session.manifest = null;
     session.profileName = "";
     session.error = null;
+    session.lastReport = null;
+    session.refreshError = null;
   },
 
   clearError() {
