@@ -10,7 +10,11 @@
   // header shows an aggregate or falls back to a plain "Transfers" label.
   const activeItems = $derived(
     transfers.items.filter(
-      (t) => t.status === "queued" || t.status === "uploading" || t.status === "paused",
+      (t) =>
+        t.status === "queued" ||
+        t.status === "uploading" ||
+        t.status === "downloading" ||
+        t.status === "paused",
     ),
   );
 
@@ -64,12 +68,19 @@
   // hasn't settled to "done" yet (Complete's retry/backoff can take a few
   // seconds). Renders a "Finishing…" label instead of a progress bar —
   // there's no more per-byte progress to show, and pause is a no-op here.
+  // Download rows never "complete" this way — a download's "done" follows
+  // straight from its last chunk, so this only ever applies to uploads.
   function isCompleting(t: Transfer): boolean {
     return t.direction === "upload" && t.status === "uploading" && t.transferred >= t.size;
   }
 
   function showCancel(t: Transfer): boolean {
-    return t.status === "queued" || t.status === "uploading" || t.status === "paused";
+    return (
+      t.status === "queued" ||
+      t.status === "uploading" ||
+      t.status === "downloading" ||
+      t.status === "paused"
+    );
   }
 </script>
 
@@ -107,7 +118,7 @@
                 <span class="label">Queued</span>
               {:else if isCompleting(t)}
                 <span class="label">Finishing…</span>
-              {:else if t.status === "uploading" || t.status === "paused"}
+              {:else if t.status === "uploading" || t.status === "downloading" || t.status === "paused"}
                 <span class="bar"><span class="fill" style="width: {percent(t)}%"></span></span>
                 <span class="pct">{percent(t)}%{t.status === "paused" ? " · Paused" : ""}</span>
               {:else if t.status === "done"}

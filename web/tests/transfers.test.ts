@@ -89,6 +89,59 @@ function multipartFile(size: number, name = "clip.mp4"): File {
   return new File([new Uint8Array(size)], name, { type: "video/mp4" });
 }
 
+function presignedGet(url: string): PresignedRequest {
+  return { method: "GET", url, expires_secs: 3600 };
+}
+
+interface ReadCall {
+  deferred: Deferred<{ done: boolean; value?: Uint8Array }>;
+}
+
+/** A `Response.body.getReader()` stand-in whose `read()` hands the test a
+ * controllable `deferred` per call, mirroring `fakePutWithProgress` — the
+ * test drives the chunk-by-chunk timing explicitly instead of using a real
+ * `ReadableStream`. */
+function fakeReader(): {
+  reader: { read: () => Promise<{ done: boolean; value?: Uint8Array }> };
+  calls: ReadCall[];
+} {
+  const calls: ReadCall[] = [];
+  const reader = {
+    read: () => {
+      const deferred = defer<{ done: boolean; value?: Uint8Array }>();
+      calls.push({ deferred });
+      return deferred.promise;
+    },
+  };
+  return { reader, calls };
+}
+
+function fakeResponse(
+  ok: boolean,
+  status: number,
+  reader: { read: () => Promise<{ done: boolean; value?: Uint8Array }> } | null,
+): Response {
+  return {
+    ok,
+    status,
+    body: reader ? { getReader: () => reader } : null,
+  } as unknown as Response;
+}
+
+interface FakeWritable {
+  write: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
+  abort: ReturnType<typeof vi.fn>;
+}
+
+function fakeWritable(): FakeWritable {
+  return {
+    write: vi.fn(async () => undefined),
+    close: vi.fn(async () => undefined),
+    abort: vi.fn(async () => undefined),
+  };
+}
+
 /** Drains the current microtask queue — enough ticks for any chain of
  * plain (non-timer) `await`s in the engine to settle. */
 async function flush(ticks = 8): Promise<void> {
@@ -97,6 +150,8 @@ async function flush(ticks = 8): Promise<void> {
 
 const realPutWithProgress = engineDeps.putWithProgress;
 const realGetClient = engineDeps.getClient;
+const realPresignGet = engineDeps.presignGet;
+const realFetchStream = engineDeps.fetchStream;
 
 describe("transfers engine", () => {
   beforeEach(() => {
@@ -107,6 +162,8 @@ describe("transfers engine", () => {
     transfers.items = [];
     engineDeps.putWithProgress = realPutWithProgress;
     engineDeps.getClient = realGetClient;
+    engineDeps.presignGet = realPresignGet;
+    engineDeps.fetchStream = realFetchStream;
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
@@ -247,5 +304,126 @@ describe("transfers engine", () => {
     expect(client.complete_multipart_upload).not.toHaveBeenCalled();
     expect(client.abort_multipart_upload).toHaveBeenCalledTimes(1);
     expect(client.abort_multipart_upload).toHaveBeenCalledWith("clip.mp4", "upload-1");
+  });
+
+  it("download reader loop accumulates progress per chunk and closes the writable exactly once on completion", async () => {
+    engineDeps.presignGet = vi.fn(async () => presignedGet("https://example.test/get"));
+    const reader = fakeReader();
+    engineDeps.fetchStream = vi.fn(async () => fakeResponse(true, 200, reader.reader));
+    const writable = fakeWritable();
+
+    transfers.enqueueDownload("photo.png", "photo.png", 10, writable as unknown as FileSystemWritableFileStream);
+    await flush();
+
+    expect(engineDeps.presignGet).toHaveBeenCalledWith("photo.png", expect.any(Number), "photo.png");
+    const transfer = transfers.items[0];
+    expect(transfer.status).toBe("downloading");
+    expect(reader.calls).toHaveLength(1);
+
+    reader.calls[0].deferred.resolve({ done: false, value: new Uint8Array([1, 2, 3, 4]) });
+    await flush();
+    expect(transfer.transferred).toBe(4);
+    expect(reader.calls).toHaveLength(2);
+
+    reader.calls[1].deferred.resolve({ done: false, value: new Uint8Array([5, 6, 7, 8, 9, 10]) });
+    await flush();
+    expect(transfer.transferred).toBe(10);
+    expect(reader.calls).toHaveLength(3);
+
+    reader.calls[2].deferred.resolve({ done: true });
+    await flush();
+
+    expect(writable.write).toHaveBeenCalledTimes(2);
+    expect(writable.close).toHaveBeenCalledTimes(1);
+    expect(writable.abort).not.toHaveBeenCalled();
+    expect(transfer.status).toBe("done");
+    expect(transfer.transferred).toBe(10);
+  });
+
+  it("cancel mid-stream aborts the fetch and the writable, never calls close, and settles cancelled", async () => {
+    engineDeps.presignGet = vi.fn(async () => presignedGet("https://example.test/get"));
+    const reader = fakeReader();
+    let capturedSignal: AbortSignal | undefined;
+    engineDeps.fetchStream = vi.fn(async (_url: string, signal: AbortSignal) => {
+      capturedSignal = signal;
+      return fakeResponse(true, 200, reader.reader);
+    });
+    const writable = fakeWritable();
+
+    transfers.enqueueDownload("clip.mp4", "clip.mp4", 10, writable as unknown as FileSystemWritableFileStream);
+    await flush();
+    expect(reader.calls).toHaveLength(1);
+
+    reader.calls[0].deferred.resolve({ done: false, value: new Uint8Array([1, 2, 3]) });
+    await flush();
+    const transfer = transfers.items[0];
+    expect(transfer.transferred).toBe(3);
+    expect(reader.calls).toHaveLength(2); // now awaiting the 2nd read()
+
+    await transfers.cancel(transfer.id);
+
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(writable.abort).toHaveBeenCalledTimes(1);
+    expect(transfer.status).toBe("cancelled");
+
+    // The in-flight read() rejects only now, as a real aborted fetch stream
+    // would — the run's own catch must see `internal.cancelled` and no-op
+    // rather than double-aborting the writable or clobbering the status.
+    reader.calls[1].deferred.reject(new DOMException("aborted", "AbortError"));
+    await flush();
+
+    expect(writable.close).not.toHaveBeenCalled();
+    expect(writable.abort).toHaveBeenCalledTimes(1);
+    expect(transfer.status).toBe("cancelled");
+  });
+
+  it("a non-OK response errors the row and aborts the writable without ever writing or closing", async () => {
+    engineDeps.presignGet = vi.fn(async () => presignedGet("https://example.test/get"));
+    engineDeps.fetchStream = vi.fn(async () => fakeResponse(false, 403, null));
+    const writable = fakeWritable();
+
+    transfers.enqueueDownload("secret.pdf", "secret.pdf", 100, writable as unknown as FileSystemWritableFileStream);
+    await flush();
+
+    const transfer = transfers.items[0];
+    expect(transfer.status).toBe("error");
+    expect(transfer.error).toContain("403");
+    expect(writable.abort).toHaveBeenCalledTimes(1);
+    expect(writable.write).not.toHaveBeenCalled();
+    expect(writable.close).not.toHaveBeenCalled();
+  });
+
+  it("a download queues behind 3 active uploads and dispatches once a slot frees", async () => {
+    const put = fakePutWithProgress();
+    engineDeps.putWithProgress = put.fn;
+    const client = fakeClient();
+    engineDeps.getClient = () => client as unknown as WasmClient;
+
+    transfers.enqueue(multipartFile(10, "a.bin"), "a.bin"); // 10 bytes / 10-byte parts -> exactly 1 part each
+    transfers.enqueue(multipartFile(10, "b.bin"), "b.bin");
+    transfers.enqueue(multipartFile(10, "c.bin"), "c.bin");
+    await flush();
+    expect(put.calls).toHaveLength(3);
+    expect(transfers.items.filter((t) => t.status === "uploading")).toHaveLength(3);
+
+    const presignGetMock = vi.fn(() => new Promise<PresignedRequest>(() => {})); // never resolves; just observes dispatch
+    engineDeps.presignGet = presignGetMock;
+    engineDeps.fetchStream = vi.fn(() => new Promise<Response>(() => {}));
+    const writable = fakeWritable();
+
+    transfers.enqueueDownload("d.bin", "d.bin", 5, writable as unknown as FileSystemWritableFileStream);
+    await flush();
+
+    const download = transfers.items.find((t) => t.direction === "download")!;
+    expect(download.status).toBe("queued");
+    expect(presignGetMock).not.toHaveBeenCalled();
+
+    // Finish exactly one of the three in-flight uploads, freeing a slot.
+    put.calls[0].deferred.resolve('"etag"');
+    await flush();
+
+    expect(transfers.items.filter((t) => t.direction === "upload" && t.status === "done")).toHaveLength(1);
+    expect(download.status).toBe("downloading");
+    expect(presignGetMock).toHaveBeenCalledTimes(1);
   });
 });
