@@ -1,6 +1,7 @@
 // App-level session state (Svelte 5 runes). One connection at a time.
 import {
   createClient,
+  type DeleteReport,
   type Manifest,
   type ManifestObject,
   type ReconcileReport,
@@ -25,6 +26,8 @@ interface Session {
   clearError(): void;
   toggleFavorite(key: string): Promise<void>;
   applyUpsert(object: ManifestObject): void;
+  applyTombstone(key: string): void;
+  deleteObject(key: string): Promise<void>;
 }
 
 const DEVICE_ID_KEY = "bare-bucket/device-id";
@@ -205,5 +208,48 @@ export const session: Session = $state({
     const index = objects.findIndex((o) => o.key === object.key);
     if (index >= 0) objects[index] = merged;
     else objects.push(merged);
+  },
+
+  /** Mirrors the Rust tombstone mutator (`Manifest::mark_deleted`, PR 12
+   * [B4][B6]) on the live manifest so a delete's effect is visible without a
+   * full refresh() round-trip: sets `deleted_at` and clears `thumbnail_key`,
+   * leaving the rest of the row (including `favorite`) untouched. Found-flag
+   * shape mirrors the Rust mutator exactly [B2]: an absent key or a row
+   * that's already tombstoned is left alone — no-op, not an error. Re-finds
+   * the row off the CURRENT `session.manifest` (not a captured reference),
+   * same live-instance re-find discipline as `applyUpsert`/`toggleFavorite`
+   * — an overlapping refresh() may have replaced `session.manifest.objects`
+   * with a new array before this runs. */
+  applyTombstone(key: string) {
+    if (!session.manifest) return;
+    const found = session.manifest.objects.find((o) => o.key === key);
+    if (!found || found.deleted_at !== null) return;
+    found.deleted_at = new Date().toISOString();
+    found.thumbnail_key = null;
+  },
+
+  /** Permanently deletes `key` (spec §7.6) [B10]: calls the wasm composite
+   * (object DELETE + best-effort thumbnail DELETE + manifest tombstone, all
+   * under one write lock) and only applies the local tombstone once that
+   * call has SETTLED SUCCESSFULLY — gated on the promise resolving, not on
+   * the report's `deleted` field (always `true` today; Task 1's interface
+   * note). Any rejection (reserved-prefix, a genuine object-delete failure,
+   * manifest-conflict exhaustion) propagates to the caller instead of being
+   * swallowed here, so the confirm modal can show it and the manifest stays
+   * untouched — no optimistic removal. A `thumbnail_deleted === false`
+   * leftover is a non-blocking note (reconcile's orphan-thumb sweep heals
+   * it), never thrown. */
+  async deleteObject(key: string) {
+    if (!session.client) throw new Error("not connected");
+    let report: DeleteReport;
+    try {
+      report = (await session.client.delete_object(key)) as DeleteReport;
+    } catch (e) {
+      throw new Error(describeError(e));
+    }
+    if (report.thumbnail_deleted === false) {
+      console.warn(`delete_object: thumbnail cleanup failed for "${key}"; reconcile will clean it up later`);
+    }
+    session.applyTombstone(key);
   },
 });
