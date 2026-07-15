@@ -3,6 +3,24 @@
 //! Data-plane bytes never enter the core (spec §3.3): the UI executes the
 //! presigned requests built here, slicing the browser `File` per part. Only
 //! the small control-plane XML calls go through the client itself.
+//!
+//! ## Bucket CORS requirements (spec §8.5)
+//!
+//! Both the presigned data-plane PUTs and the signed control-plane calls in
+//! this module are executed directly by the browser, so the bucket's CORS
+//! rule must cover both shapes or uploads fail with an opaque browser CORS
+//! error instead of a usable S3 error body:
+//!
+//! - **Data-plane presigned PUTs** ([`S3Client::presign_put`],
+//!   [`S3Client::presign_upload_part`]): `AllowedMethods` must include
+//!   `PUT`, `AllowedHeaders` must cover `content-type`, and `ExposeHeaders`
+//!   **must include `ETag`** — without it, JS cannot read a part's ETag
+//!   from the response, and [`S3Client::complete_multipart_upload`] has
+//!   nothing to assemble the parts from.
+//! - **Control-plane signed calls** issued from the browser (initiate,
+//!   complete, abort, list): `AllowedHeaders` must include `authorization`,
+//!   `x-amz-date`, and `x-amz-content-sha256` — the SigV4 headers this
+//!   client signs and sends on every request.
 
 use super::{S3Client, S3Error};
 use crate::signer::{presign_query, SigningContext};
@@ -27,7 +45,11 @@ pub fn plan_upload(size: u64) -> UploadPlan {
     if size <= MULTIPART_THRESHOLD {
         return UploadPlan::SinglePut;
     }
-    // Grow the part size in whole MiB until the file fits in MAX_PARTS.
+    // Closed form: part size stays DEFAULT_PART_SIZE unless that would need
+    // more than MAX_PARTS parts, in which case it's the smallest MiB-aligned
+    // size that brings the part count back to MAX_PARTS or fewer. Implicit
+    // ceiling: S3's 5 GiB max part size times MAX_PARTS caps any uploadable
+    // object at roughly 48.8 TiB, regardless of this function's math.
     let mut part_size = DEFAULT_PART_SIZE;
     if size.div_ceil(part_size) > MAX_PARTS {
         part_size = size.div_ceil(MAX_PARTS).div_ceil(MIB) * MIB;
@@ -46,6 +68,9 @@ pub fn plan_upload(size: u64) -> UploadPlan {
 pub struct PresignedRequest {
     pub method: String,
     pub url: String,
+    /// The `expires_secs` this request was signed with, so callers (PR 10)
+    /// can track when a descriptor goes stale.
+    pub expires_secs: u64,
 }
 
 fn xml_escape(value: &str) -> String {
@@ -64,9 +89,16 @@ fn xml_escape(value: &str) -> String {
 }
 
 /// Body for CompleteMultipartUpload. `parts` are (1-based part number, ETag).
+///
+/// Convention: callers should pass parts already in ascending part-number
+/// order, but this function sorts a local copy before emitting regardless —
+/// S3 rejects out-of-order parts with `InvalidPartOrder`, and parts routinely
+/// arrive out of order when multiple parts upload concurrently.
 fn build_complete_body(parts: &[(u32, String)]) -> String {
+    let mut sorted = parts.to_vec();
+    sorted.sort_by_key(|(number, _)| *number);
     let mut body = String::from("<CompleteMultipartUpload>");
-    for (number, etag) in parts {
+    for (number, etag) in &sorted {
         body.push_str(&format!(
             "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>",
             xml_escape(etag)
@@ -122,8 +154,19 @@ fn parse_initiate_response(xml: &[u8]) -> Result<String, S3Error> {
         .ok_or_else(|| S3Error::InvalidResponse("initiate response missing UploadId".into()))
 }
 
+/// Parse the CompleteMultipartUpload response. Unlike `parse_initiate_response`,
+/// an XML parse failure here is mapped to a *retryable* `Provider` error, not
+/// `InvalidResponse`: AWS documents that Complete can stream whitespace and
+/// then die mid-response, and retrying Complete with the same parts is the
+/// documented remedy. A response that parses fine but lacks an ETag is a
+/// different failure (a genuinely malformed success body) and stays
+/// `InvalidResponse`.
 fn parse_complete_response(xml: &[u8]) -> Result<String, S3Error> {
-    let doc = parse_xml(xml)?;
+    let doc = parse_xml(xml).map_err(|e| S3Error::Provider {
+        status: 200,
+        message: format!("unparseable complete response: {e}"),
+        retryable: true,
+    })?;
     check_error_body(&doc)?;
     text_of(&doc, "ETag")
         .map(str::to_string)
@@ -139,7 +182,22 @@ pub struct MultipartUploadInfo {
     pub initiated: String,
 }
 
-fn parse_list_uploads_response(xml: &[u8]) -> Result<Vec<MultipartUploadInfo>, S3Error> {
+/// Parses one page of `ListMultipartUploadsResult`. Returns
+/// `(uploads, is_truncated, next_key_marker, next_upload_id_marker)` so
+/// [`S3Client::list_multipart_uploads`] can loop `key-marker` /
+/// `upload-id-marker` until the provider stops truncating.
+#[allow(clippy::type_complexity)]
+fn parse_list_uploads_page(
+    xml: &[u8],
+) -> Result<
+    (
+        Vec<MultipartUploadInfo>,
+        bool,
+        Option<String>,
+        Option<String>,
+    ),
+    S3Error,
+> {
     let doc = parse_xml(xml)?;
     check_error_body(&doc)?;
     let mut uploads = Vec::new();
@@ -165,7 +223,15 @@ fn parse_list_uploads_response(xml: &[u8]) -> Result<Vec<MultipartUploadInfo>, S
             uploads.push(info);
         }
     }
-    Ok(uploads)
+    let is_truncated = text_of(&doc, "IsTruncated") == Some("true");
+    let next_key_marker = text_of(&doc, "NextKeyMarker").map(str::to_string);
+    let next_upload_id_marker = text_of(&doc, "NextUploadIdMarker").map(str::to_string);
+    Ok((
+        uploads,
+        is_truncated,
+        next_key_marker,
+        next_upload_id_marker,
+    ))
 }
 
 impl S3Client {
@@ -198,11 +264,17 @@ impl S3Client {
                 "{}://{}{}?{}",
                 self.scheme, target.host, target.uri_path, query
             ),
+            expires_secs,
         }
     }
 
     /// Presigned single PUT for files at or below [`MULTIPART_THRESHOLD`].
+    ///
+    /// The stored Content-Type comes from the browser `Blob` at PUT time —
+    /// this presigned URL doesn't pin it, so it travels unsigned but is
+    /// still accepted by the provider.
     pub fn presign_put(&self, key: &str, expires_secs: u64) -> PresignedRequest {
+        debug_assert!(expires_secs <= 604_800, "SigV4 caps expiry at 7 days");
         self.presign("PUT", key, &[], expires_secs)
     }
 
@@ -214,6 +286,11 @@ impl S3Client {
         part_number: u32,
         expires_secs: u64,
     ) -> PresignedRequest {
+        debug_assert!(
+            (1..=10_000).contains(&part_number),
+            "part_number must be within S3's 1..=10_000 range"
+        );
+        debug_assert!(expires_secs <= 604_800, "SigV4 caps expiry at 7 days");
         let part = part_number.to_string();
         self.presign(
             "PUT",
@@ -245,14 +322,20 @@ impl S3Client {
         parse_initiate_response(&body)
     }
 
-    /// Finish a multipart upload. `parts` are (1-based part number, ETag)
-    /// in ascending part order. Detects the 200-with-`<Error>`-body trap.
+    /// Finish a multipart upload. `parts` are (1-based part number, ETag);
+    /// order doesn't matter, [`build_complete_body`] sorts them. Detects the
+    /// 200-with-`<Error>`-body trap.
     pub async fn complete_multipart_upload(
         &self,
         key: &str,
         upload_id: &str,
         parts: &[(u32, String)],
     ) -> Result<String, S3Error> {
+        if parts.is_empty() {
+            return Err(S3Error::InvalidResponse(
+                "complete called with no parts".into(),
+            ));
+        }
         let body = build_complete_body(parts);
         let response = self
             .send(
@@ -284,15 +367,40 @@ impl S3Client {
     }
 
     /// List in-progress multipart uploads (reconciliation cleanup, spec §6).
+    /// Follows `key-marker`/`upload-id-marker` pagination until the provider
+    /// stops truncating the result.
     pub async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadInfo>, S3Error> {
-        let response = self
-            .send(reqwest::Method::GET, None, &[("uploads", "")], &[], None)
-            .await?;
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| S3Error::Network(e.to_string()))?;
-        parse_list_uploads_response(&body)
+        let mut all = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut upload_id_marker: Option<String> = None;
+        loop {
+            let mut query: Vec<(&str, &str)> = vec![("uploads", "")];
+            if let Some(km) = key_marker.as_deref() {
+                query.push(("key-marker", km));
+            }
+            if let Some(uim) = upload_id_marker.as_deref() {
+                query.push(("upload-id-marker", uim));
+            }
+            let response = self
+                .send(reqwest::Method::GET, None, &query, &[], None)
+                .await?;
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| S3Error::Network(e.to_string()))?;
+            let (uploads, is_truncated, next_key_marker, next_upload_id_marker) =
+                parse_list_uploads_page(&body)?;
+            all.extend(uploads);
+            if !is_truncated {
+                return Ok(all);
+            }
+            key_marker = Some(next_key_marker.ok_or_else(|| {
+                S3Error::InvalidResponse(
+                    "truncated multipart upload list without a key marker".into(),
+                )
+            })?);
+            upload_id_marker = next_upload_id_marker;
+        }
     }
 }
 
@@ -300,7 +408,7 @@ impl S3Client {
 mod tests {
     use super::{
         build_complete_body, parse_complete_response, parse_initiate_response,
-        parse_list_uploads_response, plan_upload, UploadPlan, MAX_PARTS,
+        parse_list_uploads_page, plan_upload, UploadPlan, MAX_PARTS,
     };
     use crate::s3::{S3Client, S3Config};
     use crate::signer::Credentials;
@@ -427,6 +535,21 @@ mod tests {
     }
 
     #[test]
+    fn builds_complete_request_body_sorts_out_of_order_parts() {
+        // PR 10 uploads several parts concurrently, so completion order is
+        // not upload order — S3 rejects out-of-order parts outright.
+        let parts = vec![(2, "b".to_string()), (1, "a".to_string())];
+        let body = build_complete_body(&parts);
+        assert_eq!(
+            body,
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>a</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>b</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+    }
+
+    #[test]
     fn parses_complete_success_response() {
         let xml = r#"<?xml version="1.0"?>
 <CompleteMultipartUploadResult>
@@ -453,6 +576,15 @@ mod tests {
     fn complete_response_without_etag_is_invalid() {
         let xml = b"<CompleteMultipartUploadResult></CompleteMultipartUploadResult>";
         assert!(parse_complete_response(xml).is_err());
+    }
+
+    #[test]
+    fn truncated_complete_response_is_retryable() {
+        // AWS documents Complete streaming whitespace and then possibly
+        // dying mid-response; retrying with the same parts is the
+        // documented remedy, so this must be retryable, not InvalidResponse.
+        let err = parse_complete_response(b"<truncated").unwrap_err();
+        assert!(err.is_retryable(), "got: {err}");
     }
 
     #[test]
@@ -493,6 +625,7 @@ mod tests {
         let xml = r#"<?xml version="1.0"?>
 <ListMultipartUploadsResult>
   <Bucket>photos</Bucket>
+  <IsTruncated>false</IsTruncated>
   <Upload>
     <Key>big.bin</Key><UploadId>uid-1</UploadId>
     <Initiated>2026-07-15T10:00:00.000Z</Initiated>
@@ -502,17 +635,43 @@ mod tests {
     <Initiated>2026-07-15T11:00:00.000Z</Initiated>
   </Upload>
 </ListMultipartUploadsResult>"#;
-        let uploads = parse_list_uploads_response(xml.as_bytes()).unwrap();
+        let (uploads, is_truncated, next_key_marker, next_upload_id_marker) =
+            parse_list_uploads_page(xml.as_bytes()).unwrap();
         assert_eq!(uploads.len(), 2);
         assert_eq!(uploads[0].key, "big.bin");
         assert_eq!(uploads[0].upload_id, "uid-1");
         assert_eq!(uploads[0].initiated, "2026-07-15T10:00:00.000Z");
         assert_eq!(uploads[1].upload_id, "uid-2");
+        assert!(!is_truncated);
+        assert!(next_key_marker.is_none());
+        assert!(next_upload_id_marker.is_none());
     }
 
     #[test]
     fn parses_empty_upload_list() {
         let xml = b"<ListMultipartUploadsResult></ListMultipartUploadsResult>";
-        assert!(parse_list_uploads_response(xml).unwrap().is_empty());
+        let (uploads, is_truncated, ..) = parse_list_uploads_page(xml).unwrap();
+        assert!(uploads.is_empty());
+        assert!(!is_truncated);
+    }
+
+    #[test]
+    fn parses_truncated_list_with_markers() {
+        let xml = r#"<?xml version="1.0"?>
+<ListMultipartUploadsResult>
+  <IsTruncated>true</IsTruncated>
+  <NextKeyMarker>big.bin</NextKeyMarker>
+  <NextUploadIdMarker>uid-1</NextUploadIdMarker>
+  <Upload>
+    <Key>big.bin</Key><UploadId>uid-1</UploadId>
+    <Initiated>2026-07-15T10:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#;
+        let (uploads, is_truncated, next_key_marker, next_upload_id_marker) =
+            parse_list_uploads_page(xml.as_bytes()).unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert!(is_truncated);
+        assert_eq!(next_key_marker.as_deref(), Some("big.bin"));
+        assert_eq!(next_upload_id_marker.as_deref(), Some("uid-1"));
     }
 }

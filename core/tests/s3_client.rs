@@ -293,6 +293,19 @@ async fn complete_multipart_upload_detects_200_error_body() {
 }
 
 #[tokio::test]
+async fn complete_multipart_upload_rejects_empty_parts_without_a_network_call() {
+    let server = MockServer::start().await;
+    // Deliberately no Mock mounted: if the guard didn't fire before the
+    // network call, wiremock would fail with "no matching mock found".
+    let err = client_for(&server)
+        .complete_multipart_upload("big.bin", "uid-1", &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, S3Error::InvalidResponse(_)));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn abort_multipart_upload_deletes_with_upload_id() {
     use wiremock::matchers::query_param;
 
