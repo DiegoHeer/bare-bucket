@@ -14,7 +14,7 @@
   async function switchProfile() {
     if (transfers.active) {
       const proceed = confirm(
-        "Uploads are in progress — switching profiles cancels them. Continue?",
+        "Transfers are in progress — switching profiles cancels them. Continue?",
       );
       if (!proceed) return;
       await transfers.cancelAll();

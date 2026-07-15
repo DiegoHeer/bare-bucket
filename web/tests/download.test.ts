@@ -81,7 +81,7 @@ describe("pickSaveTarget", () => {
 
 describe("anchorDownload", () => {
   it("creates an <a>, sets href and a download hint, clicks it, and removes it synchronously", () => {
-    const anchor = { href: "", download: "", click: vi.fn() };
+    const anchor = { href: "", download: "", target: "", rel: "", click: vi.fn() };
     const order: string[] = [];
     const createElement = vi.fn((tag: string) => {
       expect(tag).toBe("a");
@@ -104,5 +104,21 @@ describe("anchorDownload", () => {
     // Synchronous: appended, clicked, then removed — all within this one
     // call, never left dangling in the DOM.
     expect(order).toEqual(["append", "click", "remove"]);
+  });
+
+  it("sets target=_blank and rel=noopener so a cross-origin error response can't navigate this tab away", () => {
+    const anchor = { href: "", download: "", target: "", rel: "", click: vi.fn() };
+    const createElement = vi.fn(() => anchor);
+    const appendChild = vi.fn();
+    const removeChild = vi.fn();
+    (globalThis as { document?: unknown }).document = {
+      createElement,
+      body: { appendChild, removeChild },
+    };
+
+    anchorDownload("https://example.test/get?sig=abc123");
+
+    expect(anchor.target).toBe("_blank");
+    expect(anchor.rel).toBe("noopener");
   });
 });

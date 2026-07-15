@@ -54,11 +54,23 @@ export async function pickSaveTarget(suggestedName: string): Promise<FileSystemW
  * synchronously within this call [B1]: `url` is a presigned bearer token, so
  * it must not linger in the DOM (or anywhere reactive) a moment longer than
  * the click needs it.
+ *
+ * `target="_blank"`/`rel="noopener"` are set as a safety net, not the happy
+ * path: `download` is only honored same-origin, and this presigned URL is
+ * cross-origin (S3), so a browser normally just navigates the anchor's tab
+ * instead of downloading. A successful attachment response still triggers a
+ * same-tab-looking download and the transient blank tab closes itself; but
+ * an S3 *error* response (deleted object, clock-skew 403 — XML, no
+ * Content-Disposition) would otherwise navigate this app's own tab away and
+ * destroy in-memory secrets/transfers. Opening in a new tab confines that
+ * failure mode to a disposable tab instead of the SPA.
  */
 export function anchorDownload(url: string): void {
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = ""; // hint "save, don't navigate"; the actual filename comes from the presigned URL's response-content-disposition
+  anchor.target = "_blank"; // cross-origin S3 errors navigate this anchor instead of downloading; confine that to a throwaway tab, not the SPA's own
+  anchor.rel = "noopener"; // the new tab must not get a handle back to this window
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
