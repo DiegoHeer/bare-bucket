@@ -1,5 +1,6 @@
 use wasm_bindgen::prelude::*;
 
+pub mod manifest;
 pub mod s3;
 pub mod signer;
 
