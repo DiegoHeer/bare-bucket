@@ -83,6 +83,31 @@ async fn load_parses_existing_manifest_and_keeps_etag() {
 }
 
 #[tokio::test]
+async fn load_reports_etag_on_corrupt_manifest() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(MANIFEST_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"not gzip at all".to_vec())
+                .insert_header("etag", "\"c1\""),
+        )
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let store = ManifestStore::new(&client, "web-test");
+    let err = match store.load().await {
+        Err(e) => e,
+        Ok(_) => panic!("expected load() to fail on corrupt bytes"),
+    };
+    assert!(matches!(
+        err,
+        ManifestError::Corrupt { etag: Some(ref e), .. } if e == "\"c1\""
+    ));
+}
+
+#[tokio::test]
 async fn save_stamps_device_id_and_uses_if_match() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
@@ -241,7 +266,17 @@ async fn update_with_retry_falls_back_on_unsupported_if_match() {
         .await
         .unwrap();
     assert_eq!(outcome.etag, "\"v2\"");
+    assert_eq!(outcome.attempts, 2);
     assert!(!outcome.conditional, "degraded to last-writer-wins");
+
+    // The final (unconditional) PUT must still carry our change.
+    let requests = server.received_requests().await.unwrap();
+    let final_put = requests
+        .iter()
+        .rfind(|r| r.method.as_str() == "PUT")
+        .unwrap();
+    let saved = Manifest::from_gzipped_json(&final_put.body).unwrap();
+    assert!(saved.get("mine.txt").is_some(), "our change applied");
 }
 
 #[tokio::test]

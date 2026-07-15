@@ -1,7 +1,7 @@
 //! The bucket manifest (design spec §4): a gzipped JSON document at
 //! [`MANIFEST_KEY`] that is the source of truth for listings and change
-//! detection. Pure data model here; [`ManifestStore`] (below, Task 2) owns
-//! the load/save + conflict-retry machinery.
+//! detection. Pure data model first; [`ManifestStore`] below owns the
+//! load/save and conflict-retry machinery.
 
 use crate::s3::{S3Client, S3Error};
 use serde::{Deserialize, Serialize};
@@ -41,8 +41,13 @@ pub struct Manifest {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    #[error("corrupt manifest: {0}")]
-    Corrupt(String),
+    #[error("corrupt manifest: {detail}")]
+    Corrupt {
+        detail: String,
+        /// ETag of the corrupt object when known — lets reconciliation
+        /// conditionally replace exactly the bytes it observed.
+        etag: Option<String>,
+    },
     #[error("manifest schema {found} is newer than supported {supported}")]
     FutureSchema { found: u32, supported: u32 },
     #[error(transparent)]
@@ -75,9 +80,15 @@ impl Manifest {
         let mut json = Vec::new();
         decoder
             .read_to_end(&mut json)
-            .map_err(|e| ManifestError::Corrupt(format!("gzip: {e}")))?;
-        let manifest: Manifest = serde_json::from_slice(&json)
-            .map_err(|e| ManifestError::Corrupt(format!("json: {e}")))?;
+            .map_err(|e| ManifestError::Corrupt {
+                detail: format!("gzip: {e}"),
+                etag: None,
+            })?;
+        let manifest: Manifest =
+            serde_json::from_slice(&json).map_err(|e| ManifestError::Corrupt {
+                detail: format!("json: {e}"),
+                etag: None,
+            })?;
         if manifest.schema_version > CURRENT_SCHEMA_VERSION {
             return Err(ManifestError::FutureSchema {
                 found: manifest.schema_version,
@@ -188,10 +199,19 @@ impl<'a> ManifestStore<'a> {
     /// error: it bootstraps as an empty manifest with no ETag (spec §4.3).
     pub async fn load(&self) -> Result<LoadedManifest, ManifestError> {
         match self.client.get_object(MANIFEST_KEY).await {
-            Ok(result) => Ok(LoadedManifest {
-                manifest: Manifest::from_gzipped_json(&result.bytes)?,
-                etag: Some(result.etag),
-            }),
+            Ok(result) => {
+                let manifest = Manifest::from_gzipped_json(&result.bytes).map_err(|e| match e {
+                    ManifestError::Corrupt { detail, etag: None } => ManifestError::Corrupt {
+                        detail,
+                        etag: Some(result.etag.clone()),
+                    },
+                    other => other,
+                })?;
+                Ok(LoadedManifest {
+                    manifest,
+                    etag: Some(result.etag),
+                })
+            }
             Err(S3Error::NotFound { .. }) => Ok(LoadedManifest {
                 manifest: Manifest::empty(),
                 etag: None,
@@ -201,6 +221,9 @@ impl<'a> ManifestStore<'a> {
     }
 
     /// Serialize and PUT the manifest, stamping this device as the writer.
+    ///
+    /// Note: stamps `last_writer_device_id` on the passed manifest before the
+    /// PUT — the in-memory manifest is mutated even if the PUT then fails.
     pub async fn save(
         &self,
         manifest: &mut Manifest,
@@ -222,6 +245,13 @@ impl<'a> ManifestStore<'a> {
     /// Read → mutate → conditional PUT, retrying on conflict (spec §4.2).
     /// The mutator is re-applied to a freshly loaded manifest on every
     /// attempt, so concurrent changes are preserved.
+    ///
+    /// The mutator may run MULTIPLE times (once per attempt, and again after
+    /// an ambiguous network failure whose write actually landed). It must be
+    /// a pure, idempotent function of the manifest: no external side
+    /// effects, and values that vary per call (timestamps via
+    /// [`now_iso8601`], generated keys) must be computed ONCE, outside the
+    /// closure, and captured.
     pub async fn update_with_retry(
         &self,
         mut mutate: impl FnMut(&mut Manifest),
@@ -339,7 +369,7 @@ mod tests {
     fn corrupt_bytes_are_a_corrupt_error() {
         assert!(matches!(
             Manifest::from_gzipped_json(b"not gzip at all"),
-            Err(ManifestError::Corrupt(_))
+            Err(ManifestError::Corrupt { .. })
         ));
         // valid gzip, invalid JSON
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -347,7 +377,7 @@ mod tests {
         let gz = encoder.finish().unwrap();
         assert!(matches!(
             Manifest::from_gzipped_json(&gz),
-            Err(ManifestError::Corrupt(_))
+            Err(ManifestError::Corrupt { .. })
         ));
     }
 

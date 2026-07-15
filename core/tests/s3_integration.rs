@@ -247,7 +247,7 @@ async fn manifest_conflict_loop_preserves_concurrent_changes() {
         .update_with_retry(|m| m.upsert(object("from-a-1.txt")))
         .await
         .expect("bootstrap write");
-    assert!(first.attempts >= 1);
+    assert_eq!(first.attempts, 1);
 
     // Simulate a stale writer: B loads now…
     let stale = store_b.load().await.expect("stale load");
