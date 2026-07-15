@@ -118,10 +118,9 @@ impl WasmClient {
     pub async fn set_favorite(&self, key: String, favorite: bool) -> Result<(), JsError> {
         let _write = self.inner.manifest_write_lock.lock().await;
         let store = ManifestStore::new(&self.inner.client, &self.inner.device_id);
-        // Pure, idempotent mutator (PR 5 contract); found-ness is checked
-        // after the write from the closure's captured flag would be racy —
-        // instead verify existence on the freshly loaded manifest each
-        // attempt by keying the mutation itself.
+        // The lock serializes all writers, so the mutator's LAST run is the one
+        // whose result got written; checking the captured flag after
+        // update_with_retry therefore reflects the persisted manifest version.
         let mut found = false;
         store
             .update_with_retry(|m| {
