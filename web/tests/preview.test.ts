@@ -55,6 +55,12 @@ describe("previewKind", () => {
   it("falls back to none for anything unmatched (metadata+download fallback)", () => {
     expect(previewKind(obj("archive.tar.gz", { content_type: "application/gzip" }))).toBe("none");
   });
+
+  it("tolerates a `; charset=...`-style parameter on an exact-match content_type (polish item 5)", () => {
+    expect(previewKind(obj("data.bin", { content_type: "application/json; charset=utf-8" }))).toBe("text");
+    expect(previewKind(obj("report.bin", { content_type: "application/pdf; charset=binary" }))).toBe("pdf");
+    expect(previewKind(obj("notes.bin", { content_type: "text/plain; charset=utf-8" }))).toBe("text");
+  });
 });
 
 describe("siblingKeys", () => {
