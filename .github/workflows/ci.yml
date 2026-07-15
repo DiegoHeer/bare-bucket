@@ -37,3 +37,19 @@ jobs:
         with:
           tool: wasm-pack
       - run: wasm-pack build core --target web
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: docker compose up -d --wait
+      - run: cargo test -p bare-bucket-core --test s3_integration -- --nocapture
+        env:
+          BARE_BUCKET_IT: "1"
+          BARE_BUCKET_IT_ENDPOINT: http://127.0.0.1:9000
+          BARE_BUCKET_IT_REGION: us-east-1
+          BARE_BUCKET_IT_BUCKET: bare-bucket-it
+          BARE_BUCKET_IT_ACCESS_KEY: baretest
+          BARE_BUCKET_IT_SECRET_KEY: baretest123
