@@ -13,6 +13,7 @@ import { partRanges, putWithProgress, type PartRange, type PutProgress } from ".
 import { session } from "./session.svelte";
 import { previewKind } from "./preview";
 import { generateThumbFor, uploadThumb } from "./thumbs";
+import { displayName } from "./listing";
 import type { PresignedRequest, UploadPlan, WasmClient } from "./core";
 
 // Mirrors core/src/manifest.rs's `RESERVED_PREFIX` ([B10]) — no shared
@@ -634,7 +635,12 @@ export const transfers: {
     const transfer: Transfer = {
       id: crypto.randomUUID(),
       key,
-      name: file.name,
+      // Polish item 1: derived from the TARGET key's basename, not the
+      // source File's own name — for the common case these are identical,
+      // but a "Save as a copy" conflict resolution enqueues under a renamed
+      // key (see resolveSaveAsCopy in BrowseScreen.svelte), and the panel row
+      // must show that renamed name, not the original file's.
+      name: displayName(key).name,
       size: file.size,
       kind,
       direction: "upload", // [B4]
