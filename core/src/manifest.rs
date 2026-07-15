@@ -3,6 +3,7 @@
 //! detection. Pure data model here; [`ManifestStore`] (below, Task 2) owns
 //! the load/save + conflict-retry machinery.
 
+use crate::s3::{S3Client, S3Error};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
@@ -148,6 +149,114 @@ pub fn now_iso8601() -> String {
     time::OffsetDateTime::now_utc()
         .format(&format)
         .expect("static format cannot fail")
+}
+
+pub const MANIFEST_CONTENT_TYPE: &str = "application/gzip";
+const MAX_CONFLICT_RETRIES: u32 = 5;
+
+pub struct LoadedManifest {
+    pub manifest: Manifest,
+    /// `None` when the bucket has no manifest object yet (bootstrap).
+    pub etag: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct SaveOutcome {
+    pub etag: String,
+    pub attempts: u32,
+    /// `false` when the provider rejected `If-Match` (501) and the write
+    /// degraded to last-writer-wins — callers may surface a warning.
+    pub conditional: bool,
+}
+
+/// Loads and saves the manifest through the S3 client, implementing the
+/// conditional-write conflict loop of spec §4.2.
+pub struct ManifestStore<'a> {
+    client: &'a S3Client,
+    device_id: String,
+}
+
+impl<'a> ManifestStore<'a> {
+    pub fn new(client: &'a S3Client, device_id: impl Into<String>) -> Self {
+        ManifestStore {
+            client,
+            device_id: device_id.into(),
+        }
+    }
+
+    /// Fetch and decode the manifest. A missing manifest object is not an
+    /// error: it bootstraps as an empty manifest with no ETag (spec §4.3).
+    pub async fn load(&self) -> Result<LoadedManifest, ManifestError> {
+        match self.client.get_object(MANIFEST_KEY).await {
+            Ok(result) => Ok(LoadedManifest {
+                manifest: Manifest::from_gzipped_json(&result.bytes)?,
+                etag: Some(result.etag),
+            }),
+            Err(S3Error::NotFound { .. }) => Ok(LoadedManifest {
+                manifest: Manifest::empty(),
+                etag: None,
+            }),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Serialize and PUT the manifest, stamping this device as the writer.
+    pub async fn save(
+        &self,
+        manifest: &mut Manifest,
+        if_match: Option<&str>,
+    ) -> Result<SaveOutcome, ManifestError> {
+        manifest.last_writer_device_id = self.device_id.clone();
+        let body = manifest.to_gzipped_json();
+        let result = self
+            .client
+            .put_object(MANIFEST_KEY, &body, MANIFEST_CONTENT_TYPE, if_match)
+            .await?;
+        Ok(SaveOutcome {
+            etag: result.etag,
+            attempts: 1,
+            conditional: if_match.is_some(),
+        })
+    }
+
+    /// Read → mutate → conditional PUT, retrying on conflict (spec §4.2).
+    /// The mutator is re-applied to a freshly loaded manifest on every
+    /// attempt, so concurrent changes are preserved.
+    pub async fn update_with_retry(
+        &self,
+        mut mutate: impl FnMut(&mut Manifest),
+    ) -> Result<SaveOutcome, ManifestError> {
+        let mut attempts: u32 = 0;
+        loop {
+            let mut loaded = self.load().await?;
+            mutate(&mut loaded.manifest);
+            attempts += 1;
+            match self
+                .save(&mut loaded.manifest, loaded.etag.as_deref())
+                .await
+            {
+                Ok(mut outcome) => {
+                    outcome.attempts = attempts;
+                    return Ok(outcome);
+                }
+                Err(ManifestError::S3(S3Error::PreconditionFailed)) => {
+                    if attempts >= MAX_CONFLICT_RETRIES {
+                        return Err(ManifestError::RetriesExhausted { attempts });
+                    }
+                    // loop: re-load, re-apply
+                }
+                Err(ManifestError::S3(S3Error::Unsupported { .. })) => {
+                    // Provider rejects If-Match: degrade to last-writer-wins
+                    // (documented limitation, spec §4.2).
+                    let mut outcome = self.save(&mut loaded.manifest, None).await?;
+                    outcome.attempts = attempts + 1;
+                    outcome.conditional = false;
+                    return Ok(outcome);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
