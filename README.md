@@ -9,6 +9,7 @@ Design spec: `docs/superpowers/specs/2026-07-15-bare-bucket-v1-design.md`
 ## Repository layout
 
 - `core/` — shared Rust core (compiled to WASM for the web client)
+- `web/` — Svelte web client
 
 ## Development
 
@@ -36,3 +37,14 @@ BARE_BUCKET_IT=1 BARE_BUCKET_IT_ENDPOINT=http://127.0.0.1:9000 \
 ```
 
 Without `BARE_BUCKET_IT=1` these tests skip, so `cargo test` stays fast offline.
+
+### Web client
+
+```sh
+wasm-pack build core --target web   # build the wasm package first
+cd web
+npm install
+npm run dev                          # dev server
+npm run check && npm test -- --run  # typecheck + unit tests
+npm run build                        # production build (web/dist/)
+```
