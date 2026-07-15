@@ -87,7 +87,7 @@ fn parse_xml(xml: &[u8]) -> Result<roxmltree::Document<'_>, S3Error> {
 
 fn text_of<'a>(doc: &'a roxmltree::Document, tag: &str) -> Option<&'a str> {
     doc.descendants()
-        .find(|n| n.has_tag_name(tag))
+        .find(|n| n.tag_name().name() == tag)
         .and_then(|n| n.text())
         .map(str::trim)
         .filter(|t| !t.is_empty())
@@ -95,13 +95,20 @@ fn text_of<'a>(doc: &'a roxmltree::Document, tag: &str) -> Option<&'a str> {
 
 /// If the document is an S3 `<Error>` body, surface it as a Provider error.
 fn check_error_body(doc: &roxmltree::Document) -> Result<(), S3Error> {
-    if doc.root_element().has_tag_name("Error") {
+    if doc.root_element().tag_name().name() == "Error" {
         let code = text_of(doc, "Code").unwrap_or("UnknownError");
-        let message = text_of(doc, "Message").unwrap_or("");
+        let message = match text_of(doc, "Message") {
+            Some(m) => format!("{code}: {m}"),
+            None => code.to_string(),
+        };
+        let retryable = matches!(
+            code,
+            "InternalError" | "SlowDown" | "RequestTimeout" | "ServiceUnavailable"
+        );
         return Err(S3Error::Provider {
             status: 200,
-            message: format!("{code}: {message}"),
-            retryable: true, // Complete-time InternalError is retryable per AWS guidance
+            message,
+            retryable, // Only transient errors are retryable per AWS guidance
         });
     }
     Ok(())
@@ -396,5 +403,38 @@ mod tests {
     fn complete_response_without_etag_is_invalid() {
         let xml = b"<CompleteMultipartUploadResult></CompleteMultipartUploadResult>";
         assert!(parse_complete_response(xml).is_err());
+    }
+
+    #[test]
+    fn parses_namespaced_initiate_response() {
+        let xml = r#"<?xml version="1.0"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <UploadId>ns-uid</UploadId>
+</InitiateMultipartUploadResult>"#;
+        assert_eq!(parse_initiate_response(xml.as_bytes()).unwrap(), "ns-uid");
+    }
+
+    #[test]
+    fn parses_namespaced_complete_response() {
+        let xml = r#"<?xml version="1.0"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <ETag>"ns-etag"</ETag>
+</CompleteMultipartUploadResult>"#;
+        assert_eq!(
+            parse_complete_response(xml.as_bytes()).unwrap(),
+            "\"ns-etag\""
+        );
+    }
+
+    #[test]
+    fn complete_error_body_retryability_depends_on_code() {
+        let transient = br#"<Error><Code>InternalError</Code><Message>x</Message></Error>"#;
+        assert!(parse_complete_response(transient)
+            .unwrap_err()
+            .is_retryable());
+        let permanent = br#"<Error><Code>InvalidPart</Code><Message>x</Message></Error>"#;
+        assert!(!parse_complete_response(permanent)
+            .unwrap_err()
+            .is_retryable());
     }
 }
