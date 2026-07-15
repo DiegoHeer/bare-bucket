@@ -18,6 +18,6 @@ provisions the toolchain and WASM target automatically.
 
 ```sh
 cargo test                          # run core tests
-cargo clippy --all-targets         # lint
+cargo clippy --all-targets -- -D warnings  # lint (same flags as CI)
 wasm-pack build core --target web  # build the WASM package (output: core/pkg/)
 ```
