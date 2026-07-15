@@ -20,11 +20,15 @@
   function fileName(key: string): string {
     return showPath ? displayName(key).name : key.slice(browse.prefix.length);
   }
+
+  function parentPath(key: string): string {
+    return displayName(key).parent;
+  }
 </script>
 
 <table>
   <thead>
-    <tr><th class="name">Name</th><th class="num">Size</th><th class="num">Modified</th><th class="star-col"></th></tr>
+    <tr><th class="name">Name</th><th class="num">Size</th><th class="num">Modified</th><th class="star-col"><span class="sr-only">Favorite</span></th></tr>
   </thead>
   <tbody>
     {#each folders as folder (folder.prefix)}
@@ -39,8 +43,14 @@
       <tr>
         <td class="name">
           {iconFor(file.content_type)} {fileName(file.key)}
-          {#if showPath && displayName(file.key).parent}
-            <span class="path">{displayName(file.key).parent}</span>
+          {#if showPath && parentPath(file.key)}
+            <button
+              class="path"
+              onclick={(e) => {
+                e.stopPropagation();
+                browse.navigate(parentPath(file.key) + "/");
+              }}
+            >{parentPath(file.key)}</button>
           {/if}
         </td>
         <td class="num">{formatSize(file.size)}</td>
@@ -50,6 +60,7 @@
             class="star"
             class:starred={file.favorite}
             title={file.favorite ? "Unstar" : "Star"}
+            aria-pressed={file.favorite}
             onclick={(e) => {
               e.stopPropagation();
               void session.toggleFavorite(file.key);
@@ -95,6 +106,15 @@
     display: block;
     font-size: 11px;
     color: var(--text-dim);
+    background: none;
+    border: none;
+    padding: 0;
+    text-align: left;
+    cursor: pointer;
+  }
+  .path:hover {
+    color: var(--accent);
+    text-decoration: underline;
   }
   th.star-col,
   td.star-col {

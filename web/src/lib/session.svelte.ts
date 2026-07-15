@@ -65,6 +65,7 @@ export const session: Session = $state({
     if (session.connecting) return;
     session.connecting = true;
     session.error = null;
+    session.refreshError = null;
     let client: WasmClient | undefined;
     try {
       client = createClient({
@@ -148,6 +149,11 @@ export const session: Session = $state({
     favoriteInflight.add(key);
     try {
       await session.client.set_favorite(key, next);
+      // Re-assert on the live instance — an overlapping refresh() may have
+      // replaced `session.manifest` with pre-write data between the
+      // optimistic flip and this write completing.
+      const found = session.manifest?.objects.find((o) => o.key === key);
+      if (found) found.favorite = next;
     } catch (e) {
       // Revert on the live instance — a concurrent refresh() may have
       // replaced `session.manifest.objects` with a new array, detaching

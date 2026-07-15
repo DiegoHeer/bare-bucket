@@ -24,6 +24,7 @@
         class="star"
         class:starred={file.favorite}
         title={file.favorite ? "Unstar" : "Star"}
+        aria-pressed={file.favorite}
         onclick={(e) => {
           e.stopPropagation();
           void session.toggleFavorite(file.key);

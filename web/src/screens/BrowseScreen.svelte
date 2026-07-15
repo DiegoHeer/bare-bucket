@@ -76,7 +76,9 @@
     while (prefix !== "") {
       const { folders, files } = childEntries(objects, prefix);
       if (folders.length > 0 || files.length > 0) break;
-      prefix = prefix.replace(/[^/]+\/$/, "");
+      const next = prefix.replace(/[^/]+\/$/, "");
+      if (next === prefix) break;
+      prefix = next;
     }
     if (prefix !== browse.prefix) browse.prefix = prefix;
   });
