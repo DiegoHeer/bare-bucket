@@ -79,14 +79,18 @@
   let pdfHandle: PdfHandle | null = null;
   let textAbort: AbortController | null = null;
 
-  // Bumped on every `loadPreview()` call so a slow in-flight load (e.g. a
-  // pdf.js doc still opening) that resolves AFTER the user has already
-  // navigated to a different sibling recognizes it's stale and backs out
-  // instead of clobbering the new sibling's state (and leaking its own
-  // handle/fetch).
+  // Bumped both by `loadPreview()` and by `clearPreviewState()` itself so a
+  // slow in-flight load (e.g. a pdf.js doc still opening) that resolves
+  // AFTER the user has already navigated to a different sibling — or after
+  // the lightbox has been closed/unmounted entirely, where only the
+  // `$effect` cleanup's bare `clearPreviewState()` call runs, with no
+  // matching `loadPreview()` to bump the token itself — recognizes it's
+  // stale and backs out instead of clobbering a destroyed/superseded
+  // component's state (and leaking its own handle/fetch).
   let previewToken = 0;
 
   function clearPreviewState() {
+    previewToken += 1;
     imageUrl = null;
     textContent = null;
     textTruncated = false;
@@ -113,8 +117,12 @@
   }
 
   async function loadPreview() {
-    const token = ++previewToken;
+    // `clearPreviewState()` bumps `previewToken` itself now (see its
+    // declaration above), so capturing `token` must happen AFTER calling it
+    // — otherwise this load's own cleanup call would bump past the token it
+    // just captured, self-invalidating before the first `await` ever runs.
     clearPreviewState();
+    const token = ++previewToken;
     previewLoading = true;
     previewError = null;
     let presignedUrl: string | null = null;

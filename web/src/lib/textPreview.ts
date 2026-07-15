@@ -101,7 +101,24 @@ export async function fetchTextPreview(
   signal: AbortSignal,
   capBytes: number = TEXT_PREVIEW_CAP_BYTES,
 ): Promise<TextPreviewResult> {
+  // A 0-byte object has nothing to range into: `bytes=0-262143` against an
+  // empty object is a request the server can't satisfy (416), so skip the
+  // fetch entirely rather than surfacing that as an error+Retry the user
+  // can't do anything about.
+  if (manifestSize === 0) {
+    return { text: "", truncated: false };
+  }
+
   const response = await fetch(url, { headers: { Range: rangeHeaderValue(capBytes) }, signal });
+
+  // Defense for a stale manifest size: if the object is actually empty (or
+  // otherwise has nothing in the requested range) the server may reply 416
+  // Range Not Satisfiable even though we didn't expect it from `manifestSize`
+  // alone. Treat that as empty content rather than an error.
+  if (response.status === 416) {
+    return { text: "", truncated: false };
+  }
+
   if (!response.ok) {
     throw new Error(`preview failed with status ${response.status}`);
   }

@@ -2,11 +2,16 @@
 // range-header builder and the 206-vs-200 truncation decision. This project
 // has no DOM harness (see download.test.ts's comment), so `readCapped` is
 // exercised against a hand-rolled fake `ReadableStream` reader (same
-// stubbing style as download.test.ts) rather than a real stream; the actual
-// `fetch()`-calling `fetchTextPreview` is intentionally left untested here —
-// it's a thin composition of these pieces.
-import { describe, expect, it, vi } from "vitest";
+// stubbing style as download.test.ts) rather than a real stream. The rest of
+// `fetch()`-calling `fetchTextPreview` is a thin composition of these pieces
+// and mostly left untested here — except for its two zero-byte-object
+// special cases (below), which have their own branching worth covering
+// directly: a `manifestSize === 0` short-circuit that skips the fetch
+// entirely, and a 416-response fallback for when the manifest's cached size
+// is stale.
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  fetchTextPreview,
   isTruncated,
   parseContentRangeTotal,
   rangeHeaderValue,
@@ -113,5 +118,37 @@ describe("readCapped", () => {
     const result = await readCapped(body, 8);
     expect(result).toEqual(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
     expect(read).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("fetchTextPreview", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("returns empty content without fetching when the manifest size is 0", async () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await fetchTextPreview("https://example.com/obj", 0, new AbortController().signal);
+
+    expect(result).toEqual({ text: "", truncated: false });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("treats a 416 response as empty content instead of throwing (stale manifest size)", async () => {
+    const response = { status: 416, ok: false, headers: new Headers() };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => response),
+    );
+
+    // manifestSize is deliberately non-zero here: this is the defensive
+    // path for when the manifest's cached size is stale and the object is
+    // actually empty (or otherwise can't satisfy byte range 0), so the
+    // zero-size short-circuit above doesn't apply.
+    const result = await fetchTextPreview("https://example.com/obj", 500, new AbortController().signal);
+
+    expect(result).toEqual({ text: "", truncated: false });
   });
 });
