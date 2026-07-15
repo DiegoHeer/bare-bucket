@@ -9,7 +9,10 @@ pub mod error;
 
 pub use error::S3Error;
 
-use crate::signer::{canonical_query_string, uri_encode, Credentials};
+use crate::signer::{
+    authorization_header, canonical_query_string, sha256_hex, sign, uri_encode, CanonicalRequest,
+    Credentials, SigningContext, EMPTY_PAYLOAD_SHA256,
+};
 
 pub struct S3Config {
     /// Scheme + authority, e.g. `https://s3.example.com:9000` — no trailing slash.
@@ -22,7 +25,17 @@ pub struct S3Config {
     pub credentials: Credentials,
 }
 
-#[allow(dead_code)]
+#[derive(Debug)]
+pub struct GetResult {
+    pub bytes: Vec<u8>,
+    pub etag: String,
+}
+
+#[derive(Debug)]
+pub struct PutResult {
+    pub etag: String,
+}
+
 pub struct S3Client {
     config: S3Config,
     scheme: String,
@@ -31,7 +44,6 @@ pub struct S3Client {
     max_retries: u32,
 }
 
-#[allow(dead_code)]
 pub(crate) struct Target {
     pub url: String,
     pub host: String,
@@ -61,7 +73,6 @@ impl S3Client {
     /// URL, host header value, and signable URI path for an object key (or
     /// the bucket root when `key` is `None`). The query string is built with
     /// the signer's own encoder so signed bytes always equal wire bytes.
-    #[allow(dead_code)]
     pub(crate) fn target(&self, key: Option<&str>, query: &[(&str, &str)]) -> Target {
         let encoded_key = key.map(|k| uri_encode(k, false)).unwrap_or_default();
         let (host, uri_path) = if self.config.path_style {
@@ -89,11 +100,170 @@ impl S3Client {
             uri_path,
         }
     }
+
+    /// Sign and send one request, retrying retryable failures with backoff.
+    /// The single place where the payload hash is computed and where the
+    /// signing timestamp is read — headers and signature cannot drift.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        key: Option<&str>,
+        query: &[(&str, &str)],
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<reqwest::Response, S3Error> {
+        let payload_hash = match body {
+            Some(bytes) => sha256_hex(bytes),
+            None => EMPTY_PAYLOAD_SHA256.to_string(),
+        };
+        let target = self.target(key, query);
+        let mut attempt: u32 = 0;
+        loop {
+            let timestamp = now_timestamp();
+            let mut headers: Vec<(&str, &str)> = vec![
+                ("host", &target.host),
+                ("x-amz-content-sha256", &payload_hash),
+                ("x-amz-date", &timestamp),
+            ];
+            headers.extend_from_slice(extra_headers);
+            let ctx = SigningContext {
+                credentials: &self.config.credentials,
+                region: &self.config.region,
+                service: "s3",
+                timestamp: &timestamp,
+            };
+            let canonical = CanonicalRequest {
+                method: method.as_str(),
+                uri_path: &target.uri_path,
+                query,
+                headers: &headers,
+                payload_hash: &payload_hash,
+            };
+            let auth = authorization_header(&ctx, &sign(&ctx, &canonical));
+
+            let mut request = self
+                .http
+                .request(method.clone(), &target.url)
+                .header("authorization", auth)
+                .header("x-amz-content-sha256", &payload_hash)
+                .header("x-amz-date", &timestamp);
+            for (name, value) in extra_headers {
+                request = request.header(*name, *value);
+            }
+            if let Some(bytes) = body {
+                request = request.body(bytes.to_vec());
+            }
+
+            let error = match request.send().await {
+                Ok(response) if response.status().is_success() => return Ok(response),
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let text = response.text().await.unwrap_or_default();
+                    classify(status, key, text)
+                }
+                Err(e) => S3Error::Network(e.to_string()),
+            };
+            attempt += 1;
+            if !error.is_retryable() || attempt > self.max_retries {
+                return Err(error);
+            }
+            sleep_ms(backoff_ms(attempt)).await;
+        }
+    }
+
+    /// Cheap connectivity/credential check: HEAD on the bucket root.
+    pub async fn head_bucket(&self) -> Result<(), S3Error> {
+        self.send(reqwest::Method::HEAD, None, &[], &[], None)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn get_object(&self, key: &str) -> Result<GetResult, S3Error> {
+        let response = self
+            .send(reqwest::Method::GET, Some(key), &[], &[], None)
+            .await?;
+        let etag = required_header(&response, "etag")?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| S3Error::Network(e.to_string()))?
+            .to_vec();
+        Ok(GetResult { bytes, etag })
+    }
+
+    /// PUT an object. `if_match` adds a conditional write on the current
+    /// ETag (manifest conflict handling, spec §4.2); providers that ignore
+    /// it degrade to last-writer-wins.
+    pub async fn put_object(
+        &self,
+        key: &str,
+        body: &[u8],
+        content_type: &str,
+        if_match: Option<&str>,
+    ) -> Result<PutResult, S3Error> {
+        let mut extra: Vec<(&str, &str)> = vec![("content-type", content_type)];
+        if let Some(etag) = if_match {
+            extra.push(("if-match", etag));
+        }
+        let response = self
+            .send(reqwest::Method::PUT, Some(key), &[], &extra, Some(body))
+            .await?;
+        Ok(PutResult {
+            etag: required_header(&response, "etag")?,
+        })
+    }
+
+    pub async fn delete_object(&self, key: &str) -> Result<(), S3Error> {
+        self.send(reqwest::Method::DELETE, Some(key), &[], &[], None)
+            .await
+            .map(|_| ())
+    }
+}
+
+async fn sleep_ms(ms: u64) {
+    #[cfg(target_arch = "wasm32")]
+    gloo_timers::future::TimeoutFuture::new(ms as u32).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+fn backoff_ms(attempt: u32) -> u64 {
+    // 200ms, 800ms, 3200ms
+    200 * 4u64.pow(attempt - 1)
+}
+
+fn classify(status: u16, key: Option<&str>, body: String) -> S3Error {
+    let message: String = body.chars().take(500).collect();
+    match status {
+        404 => S3Error::NotFound {
+            key: key.unwrap_or_default().to_string(),
+        },
+        412 => S3Error::PreconditionFailed,
+        403 => S3Error::AccessDenied { message },
+        429 | 500..=599 => S3Error::Provider {
+            status,
+            message,
+            retryable: true,
+        },
+        _ => S3Error::Provider {
+            status,
+            message,
+            retryable: false,
+        },
+    }
+}
+
+fn required_header(response: &reqwest::Response, name: &str) -> Result<String, S3Error> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| S3Error::InvalidResponse(format!("missing {name} header")))
 }
 
 /// Current UTC time in ISO8601 basic format (`YYYYMMDDTHHMMSSZ`) — the single
 /// time source for both the signing context and the `x-amz-date` header.
-#[allow(dead_code)]
 pub(crate) fn now_timestamp() -> String {
     let format = time::macros::format_description!("[year][month][day]T[hour][minute][second]Z");
     time::OffsetDateTime::now_utc()
