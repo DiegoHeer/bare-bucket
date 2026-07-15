@@ -359,6 +359,115 @@ async fn manifest_conflict_loop_preserves_concurrent_changes() {
     client.delete_object(MANIFEST_KEY).await.expect("cleanup");
 }
 
+/// Mirrors the wasm `delete_object` composite's logic ([B1]-[B4] of the PR 12
+/// plan) using core primitives directly, since this test crate has no wasm
+/// boundary: read thumbnail_key from the manifest, S3 DELETE object
+/// (NotFound = success), S3 DELETE thumbnail (best-effort), tombstone via
+/// `update_with_retry_if_changed` + `Manifest::mark_deleted`.
+#[serial_test::serial]
+#[tokio::test]
+async fn delete_object_composite_removes_object_thumb_and_tombstones_row() {
+    use bare_bucket_core::manifest::{
+        now_iso8601, thumbnail_key_for, ManifestObject, ManifestStore, MANIFEST_KEY,
+    };
+
+    let Some(client) = client() else { return };
+    let _ = client.delete_object(MANIFEST_KEY).await;
+
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let key = format!("it/{run}/delete/photo.jpg");
+    let thumb_key = thumbnail_key_for(&key);
+
+    // Seed the object, a fake thumbnail under the reserved thumbs prefix,
+    // and a manifest row pointing at both.
+    client
+        .put_object(&key, b"photo bytes", "image/jpeg", None)
+        .await
+        .expect("seed object");
+    client
+        .put_object(&thumb_key, b"thumb bytes", "image/webp", None)
+        .await
+        .expect("seed thumbnail");
+
+    let store = ManifestStore::new(&client, "device-it");
+    store
+        .update_with_retry(|m| {
+            m.upsert(ManifestObject {
+                key: key.clone(),
+                size: 11,
+                etag: "\"e\"".to_string(),
+                last_modified: "2026-07-15T00:00:00Z".to_string(),
+                content_type: "image/jpeg".to_string(),
+                favorite: true,
+                thumbnail_key: Some(thumb_key.clone()),
+                deleted_at: None,
+            });
+        })
+        .await
+        .expect("seed manifest row");
+
+    // --- The composite, mirrored step by step ---
+    let loaded = store.load().await.expect("load before delete");
+    let read_thumbnail_key = loaded
+        .manifest
+        .get(&key)
+        .and_then(|o| o.thumbnail_key.clone());
+    assert_eq!(read_thumbnail_key.as_deref(), Some(thumb_key.as_str()));
+
+    match client.delete_object(&key).await {
+        Ok(()) | Err(S3Error::NotFound { .. }) => {}
+        Err(e) => panic!("object delete failed: {e}"),
+    }
+    let thumbnail_deleted = match &read_thumbnail_key {
+        Some(t) => Some(matches!(
+            client.delete_object(t).await,
+            Ok(()) | Err(S3Error::NotFound { .. })
+        )),
+        None => None,
+    };
+    assert_eq!(thumbnail_deleted, Some(true));
+
+    let deleted_at = now_iso8601();
+    let outcome = store
+        .update_with_retry_if_changed(|m| m.mark_deleted(&key, &deleted_at))
+        .await
+        .expect("tombstone write");
+    assert!(
+        outcome.is_some(),
+        "a live row was tombstoned: a change happened"
+    );
+
+    // --- Assertions ---
+    let object_err = client.get_object(&key).await.expect_err("object gone");
+    assert!(matches!(object_err, S3Error::NotFound { .. }));
+    let thumb_err = client.get_object(&thumb_key).await.expect_err("thumb gone");
+    assert!(matches!(thumb_err, S3Error::NotFound { .. }));
+
+    let after = store.load().await.expect("load after delete");
+    let row = after.manifest.get(&key).expect("tombstone row retained");
+    assert_eq!(row.deleted_at.as_deref(), Some(deleted_at.as_str()));
+    assert!(row.thumbnail_key.is_none(), "thumbnail_key cleared [B4]");
+    assert!(row.favorite, "unrelated fields preserved [B4]");
+    assert_eq!(after.manifest.live_objects().count(), 0);
+
+    // A second delete of the same (already-tombstoned) key must be a no-op
+    // manifest write: nothing left to change.
+    let deleted_at_2 = now_iso8601();
+    let outcome2 = store
+        .update_with_retry_if_changed(|m| m.mark_deleted(&key, &deleted_at_2))
+        .await
+        .expect("second tombstone attempt");
+    assert!(outcome2.is_none(), "already-tombstoned row: no change");
+
+    client
+        .delete_object(MANIFEST_KEY)
+        .await
+        .expect("cleanup manifest");
+}
+
 #[serial_test::serial]
 #[tokio::test]
 async fn reconcile_heals_out_of_band_changes() {
