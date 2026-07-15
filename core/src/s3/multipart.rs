@@ -278,6 +278,29 @@ impl S3Client {
         self.presign("PUT", key, &[], expires_secs)
     }
 
+    /// Presigned GET, optionally carrying `response-content-disposition` so
+    /// the browser's own download manager (the universal fallback path,
+    /// spec §5.2 amendment) names the saved file without any JS-side
+    /// buffering — S3-compatible providers echo this query param back as
+    /// the response header.
+    pub fn presign_get(
+        &self,
+        key: &str,
+        expires_secs: u64,
+        content_disposition: Option<&str>,
+    ) -> PresignedRequest {
+        debug_assert!(expires_secs <= 604_800, "SigV4 caps expiry at 7 days");
+        match content_disposition {
+            Some(value) => self.presign(
+                "GET",
+                key,
+                &[("response-content-disposition", value)],
+                expires_secs,
+            ),
+            None => self.presign("GET", key, &[], expires_secs),
+        }
+    }
+
     /// Presigned UploadPart PUT. `part_number` is 1-based.
     pub fn presign_upload_part(
         &self,
@@ -485,6 +508,32 @@ mod tests {
             .starts_with("https://s3.example.com:9000/photos/photos/2026/IMG%200001.jpg?"));
         assert!(req.url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
         assert!(req.url.contains("X-Amz-Expires=3600"));
+        assert!(req.url.contains("&X-Amz-Signature="));
+    }
+
+    #[test]
+    fn presign_get_without_disposition_has_no_disposition_param() {
+        let req = client().presign_get("photos/2026/IMG 0001.jpg", 3600, None);
+        assert_eq!(req.method, "GET");
+        assert!(req
+            .url
+            .starts_with("https://s3.example.com:9000/photos/photos/2026/IMG%200001.jpg?"));
+        assert!(!req.url.contains("response-content-disposition"));
+        assert!(req.url.contains("&X-Amz-Signature="));
+    }
+
+    #[test]
+    fn presign_get_with_disposition_encodes_the_query_pair() {
+        let req = client().presign_get(
+            "big.bin",
+            3600,
+            Some("attachment; filename=\"big file.bin\""),
+        );
+        assert_eq!(req.method, "GET");
+        // canonical_query_string encodes both spaces and quotes/semicolons.
+        assert!(req.url.contains(
+            "response-content-disposition=attachment%3B%20filename%3D%22big%20file.bin%22"
+        ));
         assert!(req.url.contains("&X-Amz-Signature="));
     }
 

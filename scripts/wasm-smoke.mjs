@@ -81,6 +81,37 @@ if (multipartPlan.kind !== "multipart" || multipartPlan.part_size !== 64 * 1024 
 }
 console.log("upload_plan: ok");
 
+// Presigned GET: fetch the seeded object directly, byte-compare against the
+// ci-seed content; with an attachment name, the response must carry a
+// sanitized Content-Disposition header (spec §5.2 universal download
+// fallback).
+const seedKey = "ci-seed/seed.txt";
+const presignedGet = client.presign_get(seedKey, 60, null);
+if (presignedGet.method !== "GET" || !presignedGet.url.startsWith("http")) {
+  throw new Error(`bad presigned GET request: ${JSON.stringify(presignedGet)}`);
+}
+const getResponse = await fetch(presignedGet.url);
+if (!getResponse.ok) throw new Error(`presigned GET failed: ${getResponse.status}`);
+if (getResponse.headers.get("content-disposition")) {
+  throw new Error("no disposition requested, none should be echoed back");
+}
+const expectedBytes = new TextEncoder().encode("ci-seed");
+const gotBytes = new Uint8Array(await getResponse.arrayBuffer());
+if (Buffer.compare(Buffer.from(gotBytes), Buffer.from(expectedBytes)) !== 0) {
+  throw new Error(`presigned GET body mismatch: got ${gotBytes.length} bytes`);
+}
+console.log("presign_get + fetch GET: ok");
+
+const evilName = 'weird "name"\\with\\backslash.txt';
+const presignedGetWithName = client.presign_get(seedKey, 60, evilName);
+const getWithNameResponse = await fetch(presignedGetWithName.url);
+if (!getWithNameResponse.ok) throw new Error(`presigned GET (disposition) failed: ${getWithNameResponse.status}`);
+const disposition = getWithNameResponse.headers.get("content-disposition");
+if (disposition !== 'attachment; filename="weird namewithbackslash.txt"') {
+  throw new Error(`unexpected content-disposition: ${disposition}`);
+}
+console.log("presign_get attachment_name sanitization: ok");
+
 // Single-PUT upload roundtrip: presign, PUT via Node fetch, HEAD, then
 // record it in the manifest. Overwrites the same key each run rather than
 // cleaning up afterward — there is no wasm delete method yet, and this is
