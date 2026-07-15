@@ -21,6 +21,7 @@ export const browse = $state({
   navigate(prefix: string) {
     browse.prefix = prefix;
     browse.section = "all";
+    browse.searchQuery = "";
   },
   setSection(section: "all" | "recent" | "favorites") {
     browse.section = section;

@@ -111,10 +111,10 @@
     padding: 2px;
   }
   .star.starred {
-    color: #f5c518;
+    color: var(--star);
   }
   .star:hover {
-    color: #f5c518;
+    color: var(--star);
   }
   tr.clickable {
     cursor: pointer;

@@ -67,10 +67,10 @@
     z-index: 1;
   }
   .star.starred {
-    color: #f5c518;
+    color: var(--star);
   }
   .star:hover {
-    color: #f5c518;
+    color: var(--star);
   }
   button.tile {
     cursor: pointer;

@@ -70,6 +70,7 @@
   // nearest ancestor that still exists so the "all" view never renders on a
   // dead prefix.
   $effect(() => {
+    if (browse.section !== "all") return;
     const objects = session.manifest?.objects ?? [];
     let prefix = browse.prefix;
     while (prefix !== "") {
@@ -103,7 +104,7 @@
       {#if session.refreshError}
         <div class="refresh-error" role="alert">
           {session.refreshError}
-          <button onclick={() => (session.refreshError = null)}>✕</button>
+          <button aria-label="Dismiss" onclick={() => (session.refreshError = null)}>✕</button>
         </div>
       {/if}
       <div class="content">
