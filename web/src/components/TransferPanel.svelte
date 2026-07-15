@@ -14,15 +14,15 @@
     ),
   );
 
-  // Cancelled/error rows never finish, so counting their size/uploaded bytes
-  // would permanently drag the aggregate below 100% even once every other
-  // row is done.
+  // Cancelled/error rows never finish, so counting their size/transferred
+  // bytes would permanently drag the aggregate below 100% even once every
+  // other row is done.
   const aggregatePercent = $derived.by(() => {
     const counted = transfers.items.filter((t) => t.status !== "cancelled" && t.status !== "error");
     const totalSize = counted.reduce((sum, t) => sum + t.size, 0);
     if (totalSize === 0) return 100;
-    const totalUploaded = counted.reduce((sum, t) => sum + t.uploaded, 0);
-    return Math.min(100, Math.round((totalUploaded / totalSize) * 100));
+    const totalTransferred = counted.reduce((sum, t) => sum + t.transferred, 0);
+    return Math.min(100, Math.round((totalTransferred / totalSize) * 100));
   });
 
   // Small extension-based icon (Transfer rows don't carry a content-type —
@@ -40,18 +40,24 @@
 
   function percent(t: Transfer): number {
     if (t.size === 0) return 100;
-    return Math.min(100, Math.round((t.uploaded / t.size) * 100));
+    return Math.min(100, Math.round((t.transferred / t.size) * 100));
   }
 
-  // Pause/resume only ever applies to a multipart transfer still short of
-  // its full byte count — once the part loop finishes and Complete starts,
-  // the engine's `internal.completing` flag makes pause() a no-op, so hide
-  // the control once every byte is uploaded (mirrors that phase without
+  // Pause/resume only ever applies to a multipart upload still short of its
+  // full byte count — once the part loop finishes and Complete starts, the
+  // engine's `internal.completing` flag makes pause() a no-op, so hide the
+  // control once every byte is uploaded (mirrors that phase without
   // exposing internal engine state to the UI). Gated on raw bytes rather
   // than the rounded display percent so a 99.6%-rounds-to-100% row doesn't
-  // hide pause a beat before the part loop is actually done.
+  // hide pause a beat before the part loop is actually done. Downloads never
+  // show pause/resume [B5].
   function showPauseResume(t: Transfer): boolean {
-    return t.kind === "multipart" && (t.status === "uploading" || t.status === "paused") && t.uploaded < t.size;
+    return (
+      t.direction === "upload" &&
+      t.kind === "multipart" &&
+      (t.status === "uploading" || t.status === "paused") &&
+      t.transferred < t.size
+    );
   }
 
   // True during the Complete phase: every byte is uploaded but the row
@@ -59,7 +65,7 @@
   // seconds). Renders a "Finishing…" label instead of a progress bar —
   // there's no more per-byte progress to show, and pause is a no-op here.
   function isCompleting(t: Transfer): boolean {
-    return t.status === "uploading" && t.uploaded >= t.size;
+    return t.direction === "upload" && t.status === "uploading" && t.transferred >= t.size;
   }
 
   function showCancel(t: Transfer): boolean {

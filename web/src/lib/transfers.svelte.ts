@@ -33,8 +33,9 @@ export interface Transfer {
   name: string;
   size: number;
   kind: "single" | "multipart";
+  direction: "upload" | "download"; // [B4]
   status: "queued" | "uploading" | "paused" | "done" | "error" | "cancelled";
-  uploaded: number; // bytes, reactive
+  transferred: number; // bytes moved so far, either direction, reactive [B4]
   error: string | null;
   uploadId: string | null; // multipart only
 }
@@ -51,7 +52,7 @@ interface InternalState {
   pending: PartRange[];
   /** `{ part_number, etag }` for parts that have finished (multipart only). */
   completedParts: { part_number: number; etag: string }[];
-  /** Bytes from fully-completed parts — `Transfer.uploaded` adds the
+  /** Bytes from fully-completed parts — `Transfer.transferred` adds the
    * in-flight parts' loaded bytes on top so retries never double-count. */
   completedBytes: number;
   controllers: Set<AbortController>;
@@ -110,7 +111,7 @@ async function interruptibleSleep(ms: number, internal: InternalState): Promise<
 function recomputeUploaded(transfer: Transfer, internal: InternalState): void {
   let inFlight = 0;
   for (const loaded of internal.inFlightLoaded.values()) inFlight += loaded;
-  transfer.uploaded = internal.completedBytes + inFlight;
+  transfer.transferred = internal.completedBytes + inFlight;
 }
 
 /** Releases an item's heavy engine-only bookkeeping once its `Transfer.
@@ -237,7 +238,7 @@ async function runSingle(
       internal.file!, // set at enqueue(), only nulled after this transfer is terminal
       internal.contentType,
       (loaded) => {
-        transfer.uploaded = loaded;
+        transfer.transferred = loaded;
       },
       controller.signal,
     );
@@ -245,7 +246,7 @@ async function runSingle(
     // The final upload-progress event isn't guaranteed to report the full
     // byte count before `onload` fires — assert it explicitly so the panel
     // never shows a stuck sub-100% bar for a transfer that's actually done.
-    transfer.uploaded = transfer.size;
+    transfer.transferred = transfer.size;
     await finalize(client, transfer, internal, etag);
   } catch (e) {
     internal.controllers.delete(controller);
@@ -470,8 +471,9 @@ export const transfers: {
       name: file.name,
       size: file.size,
       kind,
+      direction: "upload", // [B4]
       status: "queued",
-      uploaded: 0,
+      transferred: 0,
       error: null,
       uploadId: null,
     };
