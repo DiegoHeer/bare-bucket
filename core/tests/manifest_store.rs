@@ -310,6 +310,42 @@ async fn update_with_retry_if_changed_skips_put_when_mutator_reports_no_change()
 }
 
 #[tokio::test]
+async fn update_with_retry_if_changed_skips_put_when_thumbnail_value_is_identical() {
+    let server = MockServer::start().await;
+    let mut base = Manifest::empty();
+    let mut with_thumb = object("a.txt", 5);
+    with_thumb.thumbnail_key = Some(".bare-bucket/thumbs/a.txt.webp".to_string());
+    base.upsert(with_thumb);
+    Mock::given(method("GET"))
+        .and(path(MANIFEST_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(gz(&base))
+                .insert_header("etag", "\"v1\""),
+        )
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let store = ManifestStore::new(&client, "web-test");
+    // Setting the SAME thumbnail_key that's already stored is a no-op per
+    // the found-flag pattern [B2]: no PUT should be issued.
+    let outcome = store
+        .update_with_retry_if_changed(|m| {
+            m.set_thumbnail("a.txt", Some(".bare-bucket/thumbs/a.txt.webp".to_string()))
+        })
+        .await
+        .unwrap();
+    assert!(outcome.is_none());
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().all(|r| r.method.as_str() != "PUT"),
+        "no PUT should be issued when the thumbnail value is unchanged"
+    );
+}
+
+#[tokio::test]
 async fn update_with_retry_if_changed_writes_when_mutator_reports_a_change() {
     let server = MockServer::start().await;
     let mut base = Manifest::empty();
