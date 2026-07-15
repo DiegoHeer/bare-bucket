@@ -6,9 +6,26 @@
 // `AbortController`s, per-part progress) is kept OUT of the reactive
 // `$state` items — it lives in the `internals` side map, keyed by transfer
 // id, so the proxied `Transfer` rows stay plain, cheap-to-diff data.
-import { partRanges, putWithProgress, type PartRange } from "./upload";
+import { partRanges, putWithProgress, type PartRange, type PutProgress } from "./upload";
 import { session } from "./session.svelte";
 import type { PresignedRequest, UploadPlan, WasmClient } from "./core";
+
+/** Indirection seam for the engine's two live-only dependencies — the XHR
+ * PUT driver and "the currently connected client" — so tests can swap in a
+ * mock client/upload driver without needing a real wasm client or network
+ * access. Production code never overrides this; it's read fresh on every
+ * call so a test can reassign either field per-test without re-importing
+ * the module. */
+export const engineDeps = {
+  putWithProgress: (
+    url: string,
+    body: Blob,
+    contentType: string,
+    onProgress: PutProgress,
+    signal: AbortSignal,
+  ): Promise<string> => putWithProgress(url, body, contentType, onProgress, signal),
+  getClient: (): WasmClient | null => session.client,
+};
 
 export interface Transfer {
   id: string;
@@ -215,7 +232,7 @@ async function runSingle(
   try {
     // [B1] presign immediately before dispatch, never ahead of time.
     const presigned = client.presign_put(transfer.key, PRESIGN_EXPIRES_SECS) as PresignedRequest;
-    const etag = await putWithProgress(
+    const etag = await engineDeps.putWithProgress(
       presigned.url,
       internal.file!, // set at enqueue(), only nulled after this transfer is terminal
       internal.contentType,
@@ -261,7 +278,7 @@ async function uploadPart(
         PRESIGN_EXPIRES_SECS,
       ) as PresignedRequest;
       const blob = internal.file!.slice(part.start, part.end); // set at enqueue(), only nulled after this transfer is terminal
-      const etag = await putWithProgress(
+      const etag = await engineDeps.putWithProgress(
         presigned.url,
         blob,
         internal.contentType,
@@ -366,7 +383,7 @@ async function runMultipart(
 async function processFile(transfer: Transfer, internal: InternalState): Promise<void> {
   transfer.status = "uploading";
   internal.running = true;
-  const client = session.client;
+  const client = engineDeps.getClient();
   if (!client) {
     transfer.status = "error";
     transfer.error = "not connected";
@@ -439,7 +456,7 @@ export const transfers: {
     const contentType = file.type || "application/octet-stream"; // [B4]
     let kind: "single" | "multipart" = "single";
     let partSize = 0;
-    const client = session.client;
+    const client = engineDeps.getClient();
     if (client) {
       const plan = client.upload_plan(file.size) as UploadPlan;
       if (plan.kind === "multipart") {
@@ -525,7 +542,7 @@ export const transfers: {
     // left to abort. If Complete is mid-flight or never started, abort as
     // before.
     if (uploadId && !internal.completed) {
-      const client = session.client;
+      const client = engineDeps.getClient();
       if (client) {
         try {
           await client.abort_multipart_upload(transfer.key, uploadId);
