@@ -32,6 +32,10 @@ fn client() -> Option<S3Client> {
     )
 }
 
+// The whole live suite runs serially: tests share one bucket and one
+// manifest object, and reconcile() LISTs the entire bucket — concurrent
+// tests' transient objects would corrupt its counters.
+#[serial_test::serial]
 #[tokio::test]
 async fn full_object_lifecycle() {
     let Some(client) = client() else { return };
@@ -85,6 +89,7 @@ async fn full_object_lifecycle() {
     assert!(matches!(err, S3Error::NotFound { .. }));
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn list_paginates_across_pages() {
     let Some(client) = client() else { return };
@@ -131,6 +136,7 @@ async fn list_paginates_across_pages() {
     }
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn multipart_roundtrip_via_presigned_descriptors() {
     let Some(client) = client() else { return };
@@ -220,6 +226,7 @@ async fn multipart_roundtrip_via_presigned_descriptors() {
     client.delete_object(&key).await.expect("cleanup");
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn manifest_conflict_loop_preserves_concurrent_changes() {
     use bare_bucket_core::manifest::{ManifestObject, ManifestStore, MANIFEST_KEY};
@@ -289,6 +296,7 @@ async fn manifest_conflict_loop_preserves_concurrent_changes() {
     client.delete_object(MANIFEST_KEY).await.expect("cleanup");
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn reconcile_heals_out_of_band_changes() {
     use bare_bucket_core::manifest::{thumbnail_key_for, ManifestStore, MANIFEST_KEY};
