@@ -40,12 +40,22 @@ interface InternalState {
   /** Set by cancel(); distinguishes a deliberate abort from a genuine
    * network failure inside the retry loop. */
   cancelled: boolean;
+  /** Set once the part loop finishes and the Complete phase starts.
+   * pause() no-ops while this is set (there's nothing left to pause), and
+   * it gates whether a cancel needs to abort the multipart upload at all. */
+  completing: boolean;
+  /** Set right after `complete_multipart_upload` succeeds. Once true, the
+   * object exists remotely under this uploadId — cancel() must never call
+   * `abort_multipart_upload` afterwards (it would either no-op against an
+   * already-completed upload or, worse, race a S3-side cleanup). */
+  completed: boolean;
 }
 
 const MAX_CONCURRENT_FILES = 3;
 const MAX_CONCURRENT_PARTS = 3;
 const PRESIGN_EXPIRES_SECS = 3600;
 const COMPLETE_RETRY_DELAYS_MS = [1000, 2000]; // [B2]: 3 attempts total, 1s/2s backoff between them
+const CANCEL_POLL_MS = 100; // tick size for interruptible backoff sleeps during Complete retry
 
 const internals = new Map<string, InternalState>();
 
@@ -57,6 +67,18 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Sleeps `ms` in `CANCEL_POLL_MS` ticks, bailing out early the moment
+ * `internal.cancelled` flips — makes the Complete-retry backoff cheaply
+ * interruptible without a real cancellation-token/promise-race plumbing. */
+async function interruptibleSleep(ms: number, internal: InternalState): Promise<void> {
+  let remaining = ms;
+  while (remaining > 0 && !internal.cancelled) {
+    const tick = Math.min(CANCEL_POLL_MS, remaining);
+    await sleep(tick);
+    remaining -= tick;
+  }
+}
+
 function recomputeUploaded(transfer: Transfer, internal: InternalState): void {
   let inFlight = 0;
   for (const loaded of internal.inFlightLoaded.values()) inFlight += loaded;
@@ -64,24 +86,55 @@ function recomputeUploaded(transfer: Transfer, internal: InternalState): void {
 }
 
 /** Retries `complete_multipart_upload` up to 3 times (1s/2s backoff)
- * on ANY rejection [B2] — the UI owns this retry, not the core. */
+ * on ANY rejection [B2] — the UI owns this retry, not the core.
+ *
+ * Checks `internal.cancelled` before every attempt and again right after
+ * each backoff sleep, so a cancel() that lands mid-backoff doesn't have to
+ * wait out the remaining delay before the transfer settles. On a detected
+ * cancel, throws a sentinel `AbortError` so the caller can tell it apart
+ * from a genuine Complete failure. */
 async function completeWithRetry(
   client: WasmClient,
   key: string,
   uploadId: string,
   parts: { part_number: number; etag: string }[],
+  internal: InternalState,
 ): Promise<string> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= COMPLETE_RETRY_DELAYS_MS.length; attempt++) {
+    if (internal.cancelled) throw new DOMException("cancelled", "AbortError");
     try {
       return await client.complete_multipart_upload(key, uploadId, parts);
     } catch (e) {
       lastError = e;
       const delay = COMPLETE_RETRY_DELAYS_MS[attempt];
-      if (delay !== undefined) await sleep(delay);
+      if (delay !== undefined) {
+        await interruptibleSleep(delay, internal);
+        if (internal.cancelled) throw new DOMException("cancelled", "AbortError");
+      }
     }
   }
   throw lastError;
+}
+
+/** Best-effort `abort_multipart_upload` fired when a multipart transfer
+ * gives up for good (per-part retries exhausted, or Complete retries
+ * exhausted) — Fix 3: without this the orphaned upload would sit until
+ * reconcile's age-based cleanup catches it. Never called once `completed`
+ * is set (Complete already succeeded — there's nothing to abort). Failures
+ * here are appended to the row's error message rather than surfaced any
+ * other way; this is a courtesy cleanup, not something the user acts on. */
+async function abortEagerly(
+  client: WasmClient,
+  transfer: Transfer,
+  internal: InternalState,
+): Promise<void> {
+  if (internal.completed || !transfer.uploadId) return;
+  try {
+    await client.abort_multipart_upload(transfer.key, transfer.uploadId);
+  } catch (e) {
+    transfer.error = `${transfer.error} (also failed to abort the multipart upload: ${errMsg(e)})`;
+  }
 }
 
 /** Records the completed upload locally (no full refresh) and flips the
@@ -232,16 +285,22 @@ async function runMultipart(
   if (failure) {
     transfer.status = "error";
     transfer.error = errMsg(failure);
+    await abortEagerly(client, transfer, internal); // per-part retries exhausted: give up on the upload
     return;
   }
 
+  internal.completing = true; // part loop is done; Complete is starting — pause() no-ops from here on
   try {
     const parts = internal.completedParts.slice().sort((a, b) => a.part_number - b.part_number);
-    const etag = await completeWithRetry(client, transfer.key, transfer.uploadId, parts);
+    const etag = await completeWithRetry(client, transfer.key, transfer.uploadId, parts, internal);
+    internal.completed = true;
+    if (internal.cancelled) return; // the object exists remotely and the next refresh will surface it
     await finalize(client, transfer, internal, etag);
   } catch (e) {
+    if (internal.cancelled) return; // cancel() already set status "cancelled" + any message; don't clobber it
     transfer.status = "error";
     transfer.error = errMsg(e);
+    await abortEagerly(client, transfer, internal); // Complete retries exhausted: give up on the upload
   }
 }
 
@@ -345,6 +404,8 @@ export const transfers: {
       inFlightLoaded: new Map(),
       paused: false,
       cancelled: false,
+      completing: false,
+      completed: false,
     });
     transfers.items.push(transfer);
     pump();
@@ -354,31 +415,26 @@ export const transfers: {
     const transfer = transfers.items.find((t) => t.id === id);
     const internal = internals.get(id);
     if (!transfer || !internal) return;
+    if (internal.completing) return; // no-op: the part loop is done, there's nothing left to pause
     if (transfer.kind !== "multipart" || transfer.status !== "uploading") return;
     internal.paused = true;
     transfer.status = "paused";
     pump(); // frees this file's concurrency slot for the next queued upload
   },
 
+  /** Re-queues rather than re-entering `runMultipart` directly — routes
+   * back through `pump()`/the scheduler so a resume can't transiently push
+   * the uploading count past `MAX_CONCURRENT_FILES`, and so there's never
+   * a second concurrent `runMultipart` racing the one already in flight.
+   * `internal.pending` already has completed parts shifted out (see
+   * `worker()`), so the part loop picks up exactly where it left off. */
   resume(id: string) {
     const transfer = transfers.items.find((t) => t.id === id);
     const internal = internals.get(id);
     if (!transfer || !internal || transfer.status !== "paused") return;
     internal.paused = false;
-    transfer.status = "uploading";
-    const client = session.client;
-    if (!client) {
-      transfer.status = "error";
-      transfer.error = "not connected";
-      return;
-    }
-    void (async () => {
-      try {
-        await runMultipart(client, transfer, internal);
-      } finally {
-        pump();
-      }
-    })();
+    transfer.status = "queued";
+    pump();
   },
 
   async cancel(id: string) {
@@ -394,7 +450,11 @@ export const transfers: {
     transfer.status = "cancelled";
     pump(); // frees this file's concurrency slot for the next queued upload
 
-    if (uploadId) {
+    // Skip the abort call once Complete has already succeeded (`completed`)
+    // — the object exists remotely under this uploadId and there's nothing
+    // left to abort. If Complete is mid-flight or never started, abort as
+    // before.
+    if (uploadId && !internal.completed) {
       const client = session.client;
       if (client) {
         try {

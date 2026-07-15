@@ -48,6 +48,10 @@ describe("partRanges", () => {
     expect(partRanges(50, 100)).toEqual([{ partNumber: 1, start: 0, end: 50 }]);
   });
 
+  it("returns no parts for a zero-byte file", () => {
+    expect(partRanges(0, 5)).toEqual([]);
+  });
+
   it("covers the size exactly with contiguous 1-based parts", () => {
     const size = 64 * 1024 * 1024 * 3 + 12345;
     const partSize = 64 * 1024 * 1024;
