@@ -18,6 +18,17 @@
     ),
   );
 
+  // The header's verb: "Uploading"/"Downloading" when every active row
+  // shares one direction, "Transferring" once both are mixed in — so the
+  // aggregate (which already counts/sums both directions) never mislabels a
+  // download-only or mixed batch as an upload.
+  const activeVerb = $derived.by(() => {
+    const hasUpload = activeItems.some((t) => t.direction === "upload");
+    const hasDownload = activeItems.some((t) => t.direction === "download");
+    if (hasUpload && hasDownload) return "Transferring";
+    return hasDownload ? "Downloading" : "Uploading";
+  });
+
   // Cancelled/error rows never finish, so counting their size/transferred
   // bytes would permanently drag the aggregate below 100% even once every
   // other row is done.
@@ -91,7 +102,7 @@
         {#if activeItems.length === 0}
           Transfers
         {:else}
-          Uploading {transfers.items.length} item{transfers.items.length === 1 ? "" : "s"} · {aggregatePercent}%
+          {activeVerb} {transfers.items.length} item{transfers.items.length === 1 ? "" : "s"} · {aggregatePercent}%
         {/if}
       </span>
       <button
@@ -111,6 +122,11 @@
       <ul class="rows">
         {#each transfers.items as t (t.id)}
           <li>
+            <span
+              class="dir"
+              aria-hidden="true"
+              title={t.direction === "upload" ? "Upload" : "Download"}
+            >{t.direction === "upload" ? "↑" : "↓"}</span>
             <span class="icon">{iconFor(t.name)}</span>
             <span class="name" title={t.name}>{t.name}</span>
             <span class="status">
@@ -120,11 +136,19 @@
                 <span class="label">Finishing…</span>
               {:else if t.status === "uploading" || t.status === "downloading" || t.status === "paused"}
                 <span class="bar"><span class="fill" style="width: {percent(t)}%"></span></span>
-                <span class="pct">{percent(t)}%{t.status === "paused" ? " · Paused" : ""}</span>
+                <span class="pct"
+                  >{percent(t)}%{t.status === "paused"
+                    ? " · Paused"
+                    : t.status === "downloading"
+                      ? " · Downloading"
+                      : ""}</span
+                >
               {:else if t.status === "done"}
                 <span class="label done">✓</span>
               {:else if t.status === "error"}
-                <span class="label error" title={t.error ?? ""}>{t.error ?? "Upload failed"}</span>
+                <span class="label error" title={t.error ?? ""}
+                  >{t.error ?? (t.direction === "download" ? "Download failed" : "Upload failed")}</span
+                >
               {:else if t.status === "cancelled"}
                 <span class="label">Cancelled</span>
               {/if}
@@ -206,6 +230,11 @@
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
+  }
+  .dir {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-dim);
   }
   .icon {
     flex-shrink: 0;

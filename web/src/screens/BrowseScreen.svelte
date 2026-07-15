@@ -9,15 +9,24 @@
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
   import { transfers } from "../lib/transfers.svelte";
+  import { anchorDownload, pickSaveTarget, supportsFsa } from "../lib/download";
   import { folderLabel, hasConflict, takenNamesInPrefix } from "../lib/conflicts";
   import {
     childEntries,
+    displayName,
     favoriteFiles,
     formatSize,
     recentFiles,
     searchFiles,
     totalSize,
   } from "../lib/listing";
+  import type { ManifestObject, PresignedRequest } from "../lib/core";
+
+  // Mirrors transfers.svelte.ts's own `PRESIGN_EXPIRES_SECS` engine constant
+  // (used for the FSA path's own lazy presign, inside `enqueueDownload`) —
+  // kept as a separate constant here rather than importing it, so this task
+  // doesn't have to touch the transfer engine module.
+  const PRESIGN_EXPIRES_SECS = 3600;
 
   interface QueuedConflict {
     id: string;
@@ -59,6 +68,34 @@
         transfers.enqueue(file, key);
       }
     }
+  }
+
+  /** Per-file download handler (spec §5.2's two-tier approach) wired to the
+   * FileList/FileGrid row actions. On FSA-capable, secure-context browsers,
+   * `pickSaveTarget` is called FIRST — before any `await` on presign/fetch —
+   * so `showSaveFilePicker` still runs under the click's user activation
+   * [B7]; a user cancel (`null`) is a silent no-op. Once a target is picked,
+   * the actual streaming (including its own lazy presign) is the transfer
+   * engine's job via `enqueueDownload`. Elsewhere (Firefox/Safari, or any
+   * plain `http://` origin — the FSA/secure-context prerequisite fails
+   * there), fall back to navigating a presigned, `attachment`-dispositioned
+   * URL: the browser's own download manager takes it from there, so there's
+   * no transfer row for this path. */
+  async function downloadFile(object: ManifestObject) {
+    const name = displayName(object.key).name;
+    if (supportsFsa()) {
+      const writable = await pickSaveTarget(name);
+      if (!writable) return; // user cancelled the picker — not an error
+      transfers.enqueueDownload(object.key, name, object.size, writable);
+      return;
+    }
+    if (!session.client) return;
+    const presigned = session.client.presign_get(
+      object.key,
+      PRESIGN_EXPIRES_SECS,
+      name,
+    ) as PresignedRequest;
+    anchorDownload(presigned.url);
   }
 
   function onFileInputChange(e: Event) {
@@ -223,16 +260,16 @@
       >
         {#if browse.section === "all"}
           {#if browse.view === "list"}
-            <FileList {listing} />
+            <FileList {listing} onDownload={downloadFile} />
           {:else}
-            <FileGrid {listing} />
+            <FileGrid {listing} onDownload={downloadFile} />
           {/if}
           {#if listing.folders.length === 0 && listing.files.length === 0}
             <p class="empty">This folder is empty.</p>
           {/if}
         {:else}
           <p class="section-count">{sectionFiles.length} result{sectionFiles.length === 1 ? "" : "s"}</p>
-          <FileList files={sectionFiles} showPath />
+          <FileList files={sectionFiles} showPath onDownload={downloadFile} />
           {#if sectionFiles.length === 0}
             <p class="empty">{sectionEmptyMessage}</p>
           {/if}
