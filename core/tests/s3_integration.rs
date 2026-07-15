@@ -38,28 +38,35 @@ async fn full_object_lifecycle() {
 
     client.head_bucket().await.expect("head_bucket");
 
+    // Unique per-run prefix so local reruns never collide with leftovers
+    // from a failed run.
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
     // PUT (unconditional) — keys exercise encoding: space + unicode
-    let key = "it/lifecycle/hello world ü.txt";
+    let key = format!("it/{run}/lifecycle/hello world ü.txt");
     let put = client
-        .put_object(key, b"integration", "text/plain", None)
+        .put_object(&key, b"integration", "text/plain", None)
         .await
         .expect("put");
     assert!(!put.etag.is_empty());
 
     // GET roundtrip
-    let got = client.get_object(key).await.expect("get");
+    let got = client.get_object(&key).await.expect("get");
     assert_eq!(got.bytes, b"integration");
     assert_eq!(got.etag, put.etag);
 
     // Conditional PUT with the correct ETag succeeds
     let put2 = client
-        .put_object(key, b"integration v2", "text/plain", Some(&put.etag))
+        .put_object(&key, b"integration v2", "text/plain", Some(&put.etag))
         .await
         .expect("conditional put with matching etag");
 
     // Conditional PUT with a stale ETag must fail (MinIO supports If-Match)
     let err = client
-        .put_object(key, b"lost update", "text/plain", Some(&put.etag))
+        .put_object(&key, b"lost update", "text/plain", Some(&put.etag))
         .await
         .expect_err("conditional put with stale etag must fail");
     assert!(
@@ -68,13 +75,13 @@ async fn full_object_lifecycle() {
     );
 
     // Content reflects the winning write
-    let got2 = client.get_object(key).await.expect("get v2");
+    let got2 = client.get_object(&key).await.expect("get v2");
     assert_eq!(got2.bytes, b"integration v2");
     assert_eq!(got2.etag, put2.etag);
 
     // DELETE, then GET maps to NotFound
-    client.delete_object(key).await.expect("delete");
-    let err = client.get_object(key).await.expect_err("get after delete");
+    client.delete_object(&key).await.expect("delete");
+    let err = client.get_object(&key).await.expect_err("get after delete");
     assert!(matches!(err, S3Error::NotFound { .. }));
 }
 
@@ -82,7 +89,14 @@ async fn full_object_lifecycle() {
 async fn list_paginates_across_pages() {
     let Some(client) = client() else { return };
 
-    let prefix = "it/list/";
+    // Unique per-run prefix so local reruns never collide with leftovers
+    // from a failed run.
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let prefix = format!("it/{run}/list/");
+    let prefix = prefix.as_str();
     for i in 0..5 {
         client
             .put_object(&format!("{prefix}obj-{i}.txt"), b"x", "text/plain", None)
