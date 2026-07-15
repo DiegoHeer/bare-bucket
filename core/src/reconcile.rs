@@ -170,6 +170,14 @@ impl Default for ReconcileOptions<'static> {
 /// Full-bucket reconciliation (spec §6). Self-heals drift caused by tools
 /// that bypass the app (rclone, provider consoles), purges tombstones,
 /// removes orphaned thumbnails, and aborts dangling multipart uploads.
+///
+/// CONCURRENCY CONTRACT: the rebuild write replaces the manifest's entire
+/// `objects` Vec with rows computed from a LIST snapshot. Running this
+/// concurrently with ANY other manifest-mutating operation (upload upsert,
+/// delete tombstone, favorite toggle, thumbnail-key set) can silently erase
+/// that operation's change even though the conditional write succeeds.
+/// Callers MUST serialize reconcile() with all other manifest writers
+/// (the web shell routes every manifest mutation through one async queue).
 pub async fn reconcile(
     client: &S3Client,
     device_id: &str,
@@ -187,7 +195,7 @@ async fn reconcile_inner(
     // 1. The bucket truth.
     let all = client.list_all(None).await.map_err(ManifestError::from)?;
     let mut data_objects = Vec::new();
-    let mut thumb_keys = std::collections::HashSet::new();
+    let mut thumb_keys = HashSet::new();
     for info in all {
         if info.key.starts_with(THUMBS_PREFIX) {
             thumb_keys.insert(info.key.clone());
@@ -214,8 +222,7 @@ async fn reconcile_inner(
     let (rows, counters) = plan_rebuild(&current, &data_objects, &thumb_keys);
 
     // 4. Orphaned thumbnails.
-    let data_keys: std::collections::HashSet<&str> =
-        data_objects.iter().map(|o| o.key.as_str()).collect();
+    let data_keys: HashSet<&str> = data_objects.iter().map(|o| o.key.as_str()).collect();
     let mut thumbnails_deleted = 0u32;
     for thumb in &thumb_keys {
         let orphaned = match original_key_for_thumbnail(thumb) {
@@ -223,6 +230,8 @@ async fn reconcile_inner(
             None => true, // unparseable name inside the thumbs tree
         };
         if orphaned {
+            // NotFound counts as success: already gone — counted, since the
+            // goal state is reached.
             match client.delete_object(thumb).await {
                 Ok(()) | Err(S3Error::NotFound { .. }) => thumbnails_deleted += 1,
                 Err(e) => return Err(e.into()),
@@ -250,6 +259,8 @@ async fn reconcile_inner(
         if !old_enough {
             continue;
         }
+        // NotFound counts as success: already gone — counted, since the
+        // goal state is reached.
         match client
             .abort_multipart_upload(&upload.key, &upload.upload_id)
             .await
@@ -273,6 +284,13 @@ async fn reconcile_inner(
                 // Someone rewrote the manifest mid-recovery; it is probably
                 // valid now — rerun the whole reconcile once.
                 return Box::pin(reconcile_inner(client, device_id, options, false)).await;
+            }
+            Err(ManifestError::S3(S3Error::Unsupported { .. })) => {
+                // Provider rejects If-Match: recovery degrades to
+                // last-writer-wins, same as the normal write path.
+                let mut outcome = store.save(&mut fresh, None).await?;
+                outcome.conditional = false;
+                outcome
             }
             Err(e) => return Err(e),
         }
