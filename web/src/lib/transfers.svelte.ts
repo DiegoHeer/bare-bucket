@@ -147,6 +147,7 @@ async function finalize(
   internal: InternalState,
   etag: string,
 ): Promise<void> {
+  if (internal.cancelled) return; // Complete succeeded but the user cancelled — leave status "cancelled"; the object exists remotely and the next refresh surfaces it
   try {
     await client.upsert_object(transfer.key, transfer.size, etag, internal.contentType);
     session.applyUpsert({
@@ -236,7 +237,7 @@ async function uploadPart(
       internal.inFlightLoaded.delete(controller);
       internal.controllers.delete(controller);
       recomputeUploaded(transfer, internal);
-      if (internal.cancelled || attempt === 1) throw e;
+      if (internal.cancelled || internal.paused || attempt === 1) throw e;
       // else: loop again for the single allowed retry.
     }
   }
@@ -270,6 +271,10 @@ async function runMultipart(
         const result = await uploadPart(client, transfer, internal, part);
         internal.completedParts.push(result);
       } catch (e) {
+        // Re-push the failed part so it can be retried on resume; if paused,
+        // the part stays queued for when the transfer resumes; if not paused,
+        // the transfer errors anyway and the re-push is harmless.
+        internal.pending.unshift(part);
         failure = e;
         return;
       }
@@ -367,7 +372,7 @@ export const transfers: {
    * reconcile's age-based cleanup can reclaim it. */
   activeUploadIds() {
     return transfers.items
-      .filter((t) => t.uploadId !== null && (t.status === "uploading" || t.status === "paused"))
+      .filter((t) => t.uploadId !== null && (t.status === "uploading" || t.status === "paused" || t.status === "queued"))
       .map((t) => t.uploadId as string);
   },
 
