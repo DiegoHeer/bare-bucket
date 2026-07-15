@@ -17,12 +17,26 @@ function defaultStorage(): Storage {
   return globalThis.localStorage;
 }
 
+function isProfile(value: unknown): value is Profile {
+  if (typeof value !== "object" || value === null) return false;
+  const p = value as Record<string, unknown>;
+  return (
+    typeof p.id === "string" &&
+    typeof p.name === "string" &&
+    typeof p.endpoint === "string" &&
+    typeof p.region === "string" &&
+    typeof p.bucket === "string" &&
+    typeof p.accessKeyId === "string" &&
+    typeof p.pathStyle === "boolean"
+  );
+}
+
 export function listProfiles(storage: Storage = defaultStorage()): Profile[] {
   const raw = storage.getItem(STORAGE_KEY);
   if (raw === null) return [];
   try {
     const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as Profile[]) : [];
+    return Array.isArray(parsed) ? parsed.filter(isProfile) : [];
   } catch {
     return [];
   }

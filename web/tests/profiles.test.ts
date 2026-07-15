@@ -76,4 +76,13 @@ describe("profiles", () => {
     storage.setItem("bare-bucket/profiles", "{not json");
     expect(listProfiles(storage)).toEqual([]);
   });
+
+  it("filters out malformed entries and keeps only valid profiles", () => {
+    const profile = createProfile(fields);
+    storage.setItem(
+      "bare-bucket/profiles",
+      JSON.stringify([profile, 42, { name: null }])
+    );
+    expect(listProfiles(storage)).toEqual([profile]);
+  });
 });

@@ -55,6 +55,7 @@
   function select(profile: Profile) {
     selectedId = selectedId === profile.id ? null : profile.id;
     secret = "";
+    session.clearError();
   }
 
   function connect(event: SubmitEvent) {
@@ -116,7 +117,7 @@
         <form class="secret" onsubmit={connect}>
           <hr />
           <label>
-            Secret access key for "{selected.name}"
+            Secret access key for “{selected.name}”
             <input
               type="password"
               bind:value={secret}

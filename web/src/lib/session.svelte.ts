@@ -12,10 +12,24 @@ interface Session {
   connect(profile: Profile, secretAccessKey: string): Promise<void>;
   refreshManifest(): Promise<void>;
   disconnect(): void;
+  clearError(): void;
 }
 
+const DEVICE_ID_KEY = "bare-bucket/device-id";
+
+/** A stable per-browser device id (spec §4.1 last-writer tracking) —
+ * generated once and cached in localStorage. Falls back to a fresh,
+ * unpersisted id if localStorage is unavailable (private browsing, etc). */
 function deviceId(): string {
-  return `web-${crypto.randomUUID().slice(0, 8)}`;
+  try {
+    const existing = localStorage.getItem(DEVICE_ID_KEY);
+    if (existing) return existing;
+    const generated = `web-${crypto.randomUUID().slice(0, 8)}`;
+    localStorage.setItem(DEVICE_ID_KEY, generated);
+    return generated;
+  } catch {
+    return `web-${crypto.randomUUID().slice(0, 8)}`;
+  }
 }
 
 /** Network-shaped failures from the browser usually mean missing bucket
@@ -37,10 +51,12 @@ export const session: Session = $state({
   manifest: null,
 
   async connect(profile: Profile, secretAccessKey: string) {
+    if (session.connecting) return;
     session.connecting = true;
     session.error = null;
+    let client: WasmClient | undefined;
     try {
-      const client = createClient({
+      client = createClient({
         endpoint: profile.endpoint,
         region: profile.region,
         bucket: profile.bucket,
@@ -57,6 +73,13 @@ export const session: Session = $state({
       session.status = "connected";
     } catch (e) {
       session.error = describeError(e);
+      if (client) {
+        try {
+          client.free();
+        } catch {
+          /* mid-flight borrow; GC fallback */
+        }
+      }
     } finally {
       session.connecting = false;
     }
@@ -68,10 +91,19 @@ export const session: Session = $state({
   },
 
   disconnect() {
+    try {
+      session.client?.free();
+    } catch {
+      /* mid-flight borrow; GC fallback */
+    }
     session.status = "connect";
     session.client = null; // drops the wasm instance and the secret with it
     session.manifest = null;
     session.profileName = "";
+    session.error = null;
+  },
+
+  clearError() {
     session.error = null;
   },
 });
