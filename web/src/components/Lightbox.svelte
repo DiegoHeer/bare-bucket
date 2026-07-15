@@ -1,17 +1,17 @@
 <script lang="ts">
-  // Fullscreen preview overlay (spec §7.5, plan [B1][B3][B4][B5][B6][B9]) on
-  // ModalBase's fullscreen variant: routes on `previewKind` to an <img>
-  // (image), a ranged/capped <pre> (text, via textPreview.ts), or the
-  // metadata+download fallback for anything else/unmatched (the pdf.js
-  // renderer lands in a follow-up commit, behind the same `kind === "pdf"`
-  // branch — for now it falls through to the metadata fallback too). All
-  // overlay actions reuse BrowseScreen's existing handlers/session methods
-  // verbatim [B4] — no parallel download/favorite/delete flows here.
+  // Fullscreen preview overlay (spec §7.5, plan [B1][B3][B4][B5][B6][B7][B9])
+  // on ModalBase's fullscreen variant: routes on `previewKind` to an <img>
+  // (image), a ranged/capped <pre> (text, via textPreview.ts), a pdf.js
+  // canvas (via pdfPreview.ts), or the metadata+download fallback for
+  // anything else/unmatched. All overlay actions reuse BrowseScreen's
+  // existing handlers/session methods verbatim [B4] — no parallel
+  // download/favorite/delete flows here.
   import ModalBase from "./ModalBase.svelte";
   import { session } from "../lib/session.svelte";
   import { displayName, formatModified, formatSize } from "../lib/listing";
   import { previewKind } from "../lib/preview";
   import { fetchTextPreview } from "../lib/textPreview";
+  import { clampPage, loadPdf, type PdfHandle } from "../lib/pdfPreview";
   import type { ManifestObject, PresignedRequest } from "../lib/core";
 
   interface Props {
@@ -71,18 +71,32 @@
   let imageUrl = $state<string | null>(null);
   let textContent = $state<string | null>(null);
   let textTruncated = $state(false);
+  let pdfCanvas: HTMLCanvasElement | undefined = $state();
+  let pdfPage = $state(1);
+  let pdfPageCount = $state(0);
+  // Not $state: never read directly by the template (only via pdfPageCount
+  // and the render effect below), so it doesn't need to be reactive itself.
+  let pdfHandle: PdfHandle | null = null;
   let textAbort: AbortController | null = null;
 
-  // Bumped on every `loadPreview()` call so a slow in-flight load that
-  // resolves AFTER the user has already navigated to a different sibling
-  // recognizes it's stale and backs out instead of clobbering the new
-  // sibling's state (and leaking its own fetch).
+  // Bumped on every `loadPreview()` call so a slow in-flight load (e.g. a
+  // pdf.js doc still opening) that resolves AFTER the user has already
+  // navigated to a different sibling recognizes it's stale and backs out
+  // instead of clobbering the new sibling's state (and leaking its own
+  // handle/fetch).
   let previewToken = 0;
 
   function clearPreviewState() {
     imageUrl = null;
     textContent = null;
     textTruncated = false;
+    pdfPage = 1;
+    pdfPageCount = 0;
+    if (pdfHandle) {
+      const handle = pdfHandle;
+      pdfHandle = null;
+      void handle.destroy();
+    }
     if (textAbort) {
       textAbort.abort();
       textAbort = null;
@@ -123,9 +137,16 @@
           if (token !== previewToken) return;
           textContent = result.text;
           textTruncated = result.truncated;
+        } else if (kind === "pdf") {
+          const handle = await loadPdf(presigned.url);
+          if (token !== previewToken) {
+            void handle.destroy(); // superseded by a newer load; don't leak it
+            return;
+          }
+          pdfHandle = handle;
+          pdfPageCount = handle.numPages;
+          pdfPage = 1;
         }
-        // kind === "pdf" falls through to the metadata fallback for now —
-        // the pdf.js renderer lands in a follow-up commit.
       }
     } catch (e) {
       if (token !== previewToken) return; // stale error from a superseded load
@@ -141,6 +162,26 @@
     void loadPreview();
     return () => clearPreviewState(); // covers close/unmount; loadPreview also self-clears for direct Retry calls
   });
+
+  // Renders the current pdf page once both the doc is open and the canvas
+  // element exists in the DOM (the canvas only mounts once previewLoading
+  // goes false, i.e. after the doc has already opened — see loadPreview
+  // above — so this effect's first run always has both ready) and again on
+  // every page change.
+  $effect(() => {
+    const canvas = pdfCanvas;
+    const page = pdfPage;
+    if (kind === "pdf" && pdfHandle && canvas) {
+      void pdfHandle.renderPage(page, canvas, window.devicePixelRatio || 1);
+    }
+  });
+
+  function pdfPrevPage() {
+    pdfPage = clampPage(pdfPage - 1, pdfPageCount);
+  }
+  function pdfNextPage() {
+    pdfPage = clampPage(pdfPage + 1, pdfPageCount);
+  }
 
   function handleArrowKeys(e: KeyboardEvent) {
     if (nestedModalOpen) return;
@@ -200,6 +241,15 @@
       <!-- [B1]/[B6]: presigned GET URL straight into <img> — SVGs render this
            way too (never inline-injected, so embedded scripts can't run). -->
       <img class="image-preview" src={imageUrl} alt={name} />
+    {:else if kind === "pdf"}
+      <div class="pdf-viewer">
+        <canvas bind:this={pdfCanvas} aria-label={`${name}, page ${pdfPage} of ${pdfPageCount}`}></canvas>
+        <div class="pdf-nav">
+          <button disabled={pdfPage <= 1} aria-label="Previous page" onclick={pdfPrevPage}>‹</button>
+          <span>{pdfPage} / {pdfPageCount}</span>
+          <button disabled={pdfPage >= pdfPageCount} aria-label="Next page" onclick={pdfNextPage}>›</button>
+        </div>
+      </div>
     {:else if kind === "text" && textContent !== null}
       <div class="text-preview">
         <pre>{textContent}</pre>
@@ -365,5 +415,36 @@
     font-size: 12px;
     text-align: center;
   }
-
+  .pdf-viewer {
+    display: grid;
+    gap: 12px;
+    justify-items: center;
+    align-self: stretch;
+    justify-self: stretch;
+    overflow: auto;
+  }
+  .pdf-viewer canvas {
+    max-width: 100%;
+    box-shadow: 0 0 0 1px var(--border);
+  }
+  .pdf-nav {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .pdf-nav button {
+    background: var(--surface-raised);
+    border: none;
+    color: var(--text-bright);
+    border-radius: var(--radius-small);
+    padding: 4px 10px;
+    font-size: 16px;
+    font-weight: 700;
+  }
+  .pdf-nav button:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
 </style>
