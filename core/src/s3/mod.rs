@@ -12,7 +12,8 @@ mod multipart;
 pub use error::S3Error;
 pub use list::{ListPage, ObjectInfo};
 pub use multipart::{
-    plan_upload, PresignedRequest, UploadPlan, DEFAULT_PART_SIZE, MAX_PARTS, MULTIPART_THRESHOLD,
+    plan_upload, MultipartUploadInfo, PresignedRequest, UploadPlan, DEFAULT_PART_SIZE, MAX_PARTS,
+    MULTIPART_THRESHOLD,
 };
 
 use crate::signer::{

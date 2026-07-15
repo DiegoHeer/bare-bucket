@@ -130,6 +130,44 @@ fn parse_complete_response(xml: &[u8]) -> Result<String, S3Error> {
         .ok_or_else(|| S3Error::InvalidResponse("complete response missing ETag".into()))
 }
 
+/// An in-progress (possibly dangling) multipart upload, for reconciliation
+/// cleanup (spec §6).
+#[derive(Debug, Clone)]
+pub struct MultipartUploadInfo {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: String,
+}
+
+fn parse_list_uploads_response(xml: &[u8]) -> Result<Vec<MultipartUploadInfo>, S3Error> {
+    let doc = parse_xml(xml)?;
+    check_error_body(&doc)?;
+    let mut uploads = Vec::new();
+    for upload in doc
+        .descendants()
+        .filter(|n| n.tag_name().name() == "Upload")
+    {
+        let child_text = |tag: &str| {
+            upload
+                .children()
+                .find(|n| n.tag_name().name() == tag)
+                .and_then(|n| n.text())
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let info = MultipartUploadInfo {
+            key: child_text("Key"),
+            upload_id: child_text("UploadId"),
+            initiated: child_text("Initiated"),
+        };
+        if !info.key.is_empty() && !info.upload_id.is_empty() {
+            uploads.push(info);
+        }
+    }
+    Ok(uploads)
+}
+
 impl S3Client {
     fn presign(
         &self,
@@ -244,13 +282,25 @@ impl S3Client {
         .await
         .map(|_| ())
     }
+
+    /// List in-progress multipart uploads (reconciliation cleanup, spec §6).
+    pub async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadInfo>, S3Error> {
+        let response = self
+            .send(reqwest::Method::GET, None, &[("uploads", "")], &[], None)
+            .await?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| S3Error::Network(e.to_string()))?;
+        parse_list_uploads_response(&body)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_complete_body, parse_complete_response, parse_initiate_response, plan_upload,
-        UploadPlan, MAX_PARTS,
+        build_complete_body, parse_complete_response, parse_initiate_response,
+        parse_list_uploads_response, plan_upload, UploadPlan, MAX_PARTS,
     };
     use crate::s3::{S3Client, S3Config};
     use crate::signer::Credentials;
@@ -436,5 +486,33 @@ mod tests {
         assert!(!parse_complete_response(permanent)
             .unwrap_err()
             .is_retryable());
+    }
+
+    #[test]
+    fn parses_list_multipart_uploads() {
+        let xml = r#"<?xml version="1.0"?>
+<ListMultipartUploadsResult>
+  <Bucket>photos</Bucket>
+  <Upload>
+    <Key>big.bin</Key><UploadId>uid-1</UploadId>
+    <Initiated>2026-07-15T10:00:00.000Z</Initiated>
+  </Upload>
+  <Upload>
+    <Key>other.mp4</Key><UploadId>uid-2</UploadId>
+    <Initiated>2026-07-15T11:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#;
+        let uploads = parse_list_uploads_response(xml.as_bytes()).unwrap();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0].key, "big.bin");
+        assert_eq!(uploads[0].upload_id, "uid-1");
+        assert_eq!(uploads[0].initiated, "2026-07-15T10:00:00.000Z");
+        assert_eq!(uploads[1].upload_id, "uid-2");
+    }
+
+    #[test]
+    fn parses_empty_upload_list() {
+        let xml = b"<ListMultipartUploadsResult></ListMultipartUploadsResult>";
+        assert!(parse_list_uploads_response(xml).unwrap().is_empty());
     }
 }
