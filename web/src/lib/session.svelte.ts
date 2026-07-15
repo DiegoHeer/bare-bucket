@@ -27,6 +27,7 @@ interface Session {
   toggleFavorite(key: string): Promise<void>;
   applyUpsert(object: ManifestObject): void;
   applyTombstone(key: string): void;
+  applyThumbnail(key: string, thumbnailKey: string): void;
   deleteObject(key: string): Promise<void>;
 }
 
@@ -226,6 +227,23 @@ export const session: Session = $state({
     if (!found || found.deleted_at !== null) return;
     found.deleted_at = new Date().toISOString();
     found.thumbnail_key = null;
+  },
+
+  /** Mirrors a successful `set_thumbnail` onto the live manifest row (PR 14
+   * on-upload hook + "Generate missing thumbnails" runner [B5][B6]) — same
+   * live-instance re-find discipline as `applyUpsert`/`applyTombstone`: an
+   * overlapping refresh()/delete may have replaced `session.manifest.objects`
+   * with a new array, or tombstoned/removed this row entirely, between the
+   * caller's `set_thumbnail` call resolving and this running, so a stale or
+   * now-tombstoned row is left alone rather than resurrected. Callers are
+   * expected to only invoke this when `set_thumbnail`'s own report said
+   * `updated: true` — this method itself has no found-flag report of its
+   * own to return. */
+  applyThumbnail(key: string, thumbnailKey: string) {
+    if (!session.manifest) return;
+    const found = session.manifest.objects.find((o) => o.key === key);
+    if (!found || found.deleted_at !== null) return;
+    found.thumbnail_key = thumbnailKey;
   },
 
   /** Permanently deletes `key` (spec §7.6) [B10]: calls the wasm composite
