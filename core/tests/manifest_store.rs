@@ -280,6 +280,69 @@ async fn update_with_retry_falls_back_on_unsupported_if_match() {
 }
 
 #[tokio::test]
+async fn update_with_retry_if_changed_skips_put_when_mutator_reports_no_change() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(MANIFEST_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(gz(&Manifest::empty()))
+                .insert_header("etag", "\"v1\""),
+        )
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let store = ManifestStore::new(&client, "web-test");
+    // Tombstoning an absent key is a no-op per the found-flag pattern [B2]:
+    // update_with_retry_if_changed must not issue a PUT at all.
+    let outcome = store
+        .update_with_retry_if_changed(|m| m.mark_deleted("missing.txt", "2026-07-15T12:00:00Z"))
+        .await
+        .unwrap();
+    assert!(outcome.is_none());
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().all(|r| r.method.as_str() != "PUT"),
+        "no PUT should be issued when nothing changed"
+    );
+}
+
+#[tokio::test]
+async fn update_with_retry_if_changed_writes_when_mutator_reports_a_change() {
+    let server = MockServer::start().await;
+    let mut base = Manifest::empty();
+    base.upsert(object("a.txt", 5));
+    Mock::given(method("GET"))
+        .and(path(MANIFEST_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(gz(&base))
+                .insert_header("etag", "\"v1\""),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(MANIFEST_PATH))
+        .and(header("if-match", "\"v1\""))
+        .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v2\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let store = ManifestStore::new(&client, "web-test");
+    let outcome = store
+        .update_with_retry_if_changed(|m| m.mark_deleted("a.txt", "2026-07-15T12:00:00Z"))
+        .await
+        .unwrap()
+        .expect("a live row was tombstoned: a change happened");
+    assert_eq!(outcome.etag, "\"v2\"");
+    assert_eq!(outcome.attempts, 1);
+}
+
+#[tokio::test]
 async fn bootstrap_save_is_unconditional() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

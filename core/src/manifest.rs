@@ -130,14 +130,22 @@ impl Manifest {
         }
     }
 
-    /// Tombstone a key (spec §4.4). Returns false if the key is unknown.
+    /// Tombstone a live key (spec §4.4): sets `deleted_at` and clears
+    /// `thumbnail_key`, preserving the rest of the row [B4, PR 12].
+    ///
+    /// Found-flag pattern (PR 12 [B2] — deliberately NOT `set_favorite`'s
+    /// write-on-miss shape): an absent key or a row that is already
+    /// tombstoned is left untouched and this returns `false`, so a caller
+    /// driving [`ManifestStore::update_with_retry_if_changed`] can skip a
+    /// pointless PUT.
     pub fn mark_deleted(&mut self, key: &str, deleted_at: &str) -> bool {
         match self.get_mut(key) {
-            Some(object) => {
+            Some(object) if object.deleted_at.is_none() => {
                 object.deleted_at = Some(deleted_at.to_string());
+                object.thumbnail_key = None;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -271,10 +279,38 @@ impl<'a> ManifestStore<'a> {
         &self,
         mut mutate: impl FnMut(&mut Manifest),
     ) -> Result<SaveOutcome, ManifestError> {
+        let outcome = self
+            .update_with_retry_if_changed(|m| {
+                mutate(m);
+                true
+            })
+            .await?;
+        Ok(outcome.expect("mutator above always reports a change"))
+    }
+
+    /// Like [`Self::update_with_retry`], but `mutate` reports whether it
+    /// actually changed the manifest (PR 12 [B2] no-change short-circuit).
+    /// When the FIRST application finds nothing to change, no PUT happens at
+    /// all and this returns `Ok(None)`. On a conflict retry, `mutate` is
+    /// re-applied to the freshly loaded manifest as usual; if THAT
+    /// application also reports no change (e.g. someone else already made
+    /// the same edit), the loop stops there and returns `Ok(None)` rather
+    /// than writing a no-op PUT.
+    ///
+    /// Same purity/idempotency contract as `update_with_retry`: `mutate` may
+    /// run multiple times and must be a pure function of the loaded
+    /// manifest plus values captured before the call (timestamps, generated
+    /// keys) — never computed inside the closure.
+    pub async fn update_with_retry_if_changed(
+        &self,
+        mut mutate: impl FnMut(&mut Manifest) -> bool,
+    ) -> Result<Option<SaveOutcome>, ManifestError> {
         let mut attempts: u32 = 0;
         loop {
             let mut loaded = self.load().await?;
-            mutate(&mut loaded.manifest);
+            if !mutate(&mut loaded.manifest) {
+                return Ok(None);
+            }
             attempts += 1;
             match self
                 .save(&mut loaded.manifest, loaded.etag.as_deref())
@@ -282,7 +318,7 @@ impl<'a> ManifestStore<'a> {
             {
                 Ok(mut outcome) => {
                     outcome.attempts = attempts;
-                    return Ok(outcome);
+                    return Ok(Some(outcome));
                 }
                 Err(ManifestError::S3(S3Error::PreconditionFailed)) => {
                     if attempts >= MAX_CONFLICT_RETRIES {
@@ -296,7 +332,7 @@ impl<'a> ManifestStore<'a> {
                     let mut outcome = self.save(&mut loaded.manifest, None).await?;
                     outcome.attempts = attempts + 1;
                     outcome.conditional = false;
-                    return Ok(outcome);
+                    return Ok(Some(outcome));
                 }
                 Err(e) => return Err(e),
             }
@@ -419,7 +455,45 @@ mod tests {
             Some("2026-07-15T12:00:00Z")
         );
         assert_eq!(manifest.live_objects().count(), 0);
+    }
+
+    #[test]
+    fn mark_deleted_on_absent_key_reports_no_change() {
+        let mut manifest = Manifest::empty();
+        manifest.upsert(object("a.txt"));
         assert!(!manifest.mark_deleted("missing.txt", "2026-07-15T12:00:00Z"));
+        assert!(manifest.get("missing.txt").is_none());
+    }
+
+    #[test]
+    fn mark_deleted_on_already_tombstoned_row_reports_no_change() {
+        let mut manifest = Manifest::empty();
+        manifest.upsert(object("a.txt"));
+        assert!(manifest.mark_deleted("a.txt", "2026-07-15T12:00:00Z"));
+        // Found-flag pattern [B2]: re-tombstoning an already-deleted row is a
+        // no-op that reports false, and must not stomp the original timestamp.
+        assert!(!manifest.mark_deleted("a.txt", "2026-07-15T13:00:00Z"));
+        assert_eq!(
+            manifest.get("a.txt").unwrap().deleted_at.as_deref(),
+            Some("2026-07-15T12:00:00Z"),
+            "original tombstone timestamp is preserved"
+        );
+    }
+
+    #[test]
+    fn mark_deleted_clears_thumbnail_key_and_preserves_the_rest_of_the_row() {
+        let mut manifest = Manifest::empty();
+        let mut with_thumb = object("a.txt");
+        with_thumb.favorite = true;
+        with_thumb.thumbnail_key = Some(".bare-bucket/thumbs/a.txt.webp".to_string());
+        manifest.upsert(with_thumb);
+
+        assert!(manifest.mark_deleted("a.txt", "2026-07-15T12:00:00Z"));
+        let row = manifest.get("a.txt").unwrap();
+        assert!(row.thumbnail_key.is_none(), "thumbnail_key cleared [B4]");
+        assert!(row.favorite, "favorite preserved [B4]");
+        assert_eq!(row.size, 1024, "unrelated fields preserved [B4]");
+        assert_eq!(row.deleted_at.as_deref(), Some("2026-07-15T12:00:00Z"));
     }
 
     #[test]
