@@ -10,7 +10,9 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 
-use crate::manifest::{now_iso8601, ManifestObject, ManifestStore, RESERVED_PREFIX};
+use crate::manifest::{
+    now_iso8601, thumbnail_key_for, ManifestObject, ManifestStore, RESERVED_PREFIX,
+};
 use crate::reconcile::{reconcile, ReconcileOptions};
 use crate::s3::{
     plan_upload, HeadResult, PresignedRequest, S3Client, S3Config, S3Error, UploadPlan,
@@ -377,6 +379,46 @@ impl WasmClient {
             already_absent: outcome.is_none(),
         })
     }
+
+    /// Set or clear an object's thumbnail key (spec §9, PR 14 [B2][B3]).
+    /// Holds the manifest writer lock (see module docs) for the
+    /// read→mutate→conditional-PUT cycle.
+    ///
+    /// Found-flag mutator via [`crate::manifest::Manifest::set_thumbnail`]:
+    /// an absent key, a tombstoned row (tombstoned = absent, PR 10 rule), or
+    /// setting an identical value are all no-ops — no PUT is issued and the
+    /// report carries `updated: false`.
+    pub async fn set_thumbnail(
+        &self,
+        key: String,
+        thumbnail_key: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        // Reserved-prefix rejection happens before any network call, matching
+        // delete_object's contract.
+        if key.starts_with(RESERVED_PREFIX) {
+            return Err(JsError::new(&format!(
+                "cannot set thumbnail for reserved key: {key}"
+            )));
+        }
+
+        let _write = self.inner.manifest_write_lock.lock().await;
+        let store = ManifestStore::new(&self.inner.client, &self.inner.device_id);
+        let outcome = store
+            .update_with_retry_if_changed(|m| m.set_thumbnail(&key, thumbnail_key.clone()))
+            .await
+            .map_err(js_error)?;
+        to_js(&SetThumbnailReport {
+            updated: outcome.is_some(),
+        })
+    }
+
+    /// Bucket key of `key`'s thumbnail (`.bare-bucket/thumbs/<key>.webp`) —
+    /// a pure re-export of the core helper so web derives the SAME key shape
+    /// rather than inventing its own layout ([B3]). Key math, not image
+    /// code, so it's allowed despite [B1]'s "no image code in Rust" rule.
+    pub fn thumbnail_key_for(&self, key: String) -> String {
+        thumbnail_key_for(&key)
+    }
 }
 
 /// Strips characters that would let a display name break out of the
@@ -461,6 +503,12 @@ struct DeleteReport {
     deleted: bool,
     thumbnail_deleted: Option<bool>,
     already_absent: bool,
+}
+
+/// Report for [`WasmClient::set_thumbnail`] (PR 14 [B2]).
+#[derive(serde::Serialize)]
+struct SetThumbnailReport {
+    updated: bool,
 }
 
 /// ReconcileReport mirror with serde derive (the core struct deliberately
