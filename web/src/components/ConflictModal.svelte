@@ -3,9 +3,10 @@
   // upload already names a live manifest object. One instance is rendered
   // per queued conflict — BrowseScreen keys the block by the conflict's id
   // so a fresh instance mounts per conflict, which both re-runs the
-  // head_object check below and re-focuses the Cancel button for each new
-  // conflict in the queue.
+  // head_object check below and re-focuses the Cancel button (via
+  // ModalBase's initial-focus hook) for each new conflict in the queue.
   import { onMount } from "svelte";
+  import ModalBase from "./ModalBase.svelte";
   import { session } from "../lib/session.svelte";
   import type { HeadResult } from "../lib/core";
   import { nextFreeName } from "../lib/upload";
@@ -34,7 +35,6 @@
   // (keyed by the conflict's id), so `onMount` runs exactly once per
   // conflict shown — no need to react to prop changes within an instance.
   onMount(() => {
-    cancelButton?.focus();
     const client = session.client;
     const manifestEtag = session.manifest?.objects.find((o) => o.key === targetKey)?.etag ?? null;
     if (!client) return;
@@ -49,54 +49,25 @@
       });
   });
 
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      onCancel();
-    }
-  }
-
   function saveAsCopy() {
     onSaveAsCopy(nextFreeName(file.name, takenNames));
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
-<div class="backdrop">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="conflict-title" tabindex="-1">
-    <h2 id="conflict-title">File already exists</h2>
-    <p>“{file.name}” already exists in this folder.</p>
-    {#if outOfBand}
-      <p class="warning">This file changed outside the app since the last sync.</p>
-    {/if}
-    <div class="actions">
-      <button class="primary" onclick={onOverwrite}>Overwrite</button>
-      <button class="ghost" onclick={saveAsCopy}>Save as a copy</button>
-      <button class="ghost" bind:this={cancelButton} onclick={onCancel}>Cancel</button>
-    </div>
+<ModalBase labelledBy="conflict-title" onClose={onCancel} getInitialFocus={() => cancelButton}>
+  <h2 id="conflict-title">File already exists</h2>
+  <p>“{file.name}” already exists in this folder.</p>
+  {#if outOfBand}
+    <p class="warning">This file changed outside the app since the last sync.</p>
+  {/if}
+  <div class="actions">
+    <button class="primary" onclick={onOverwrite}>Overwrite</button>
+    <button class="ghost" onclick={saveAsCopy}>Save as a copy</button>
+    <button class="ghost" bind:this={cancelButton} onclick={onCancel}>Cancel</button>
   </div>
-</div>
+</ModalBase>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: grid;
-    place-items: center;
-    z-index: 100;
-  }
-  .modal {
-    width: min(380px, 92vw);
-    background: var(--surface);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.4);
-    padding: 20px;
-    display: grid;
-    gap: 10px;
-  }
   h2 {
     margin: 0;
     font-size: 15px;

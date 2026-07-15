@@ -5,13 +5,13 @@
   // small.
   //
   // Confirm is never reachable via a bare Enter: initial focus lands on
-  // Cancel (like ConflictModal), and there is deliberately no keydown
-  // handling that maps Enter to the destructive action — activating the
-  // focused Cancel button with Enter is fine, since that's Cancel, not
-  // Delete. The Delete button must be explicitly clicked/activated once
-  // focus is moved to it.
-  import { onMount } from "svelte";
+  // Cancel (like ConflictModal, via ModalBase's initial-focus hook), and
+  // there is deliberately no keydown handling that maps Enter to the
+  // destructive action — activating the focused Cancel button with Enter is
+  // fine, since that's Cancel, not Delete. The Delete button must be
+  // explicitly clicked/activated once focus is moved to it.
   import { escapeShouldCancel, runConfirmDelete } from "../lib/deleteConfirm";
+  import ModalBase from "./ModalBase.svelte";
 
   interface Props {
     /** Display name only (not the full key) — matches ConflictModal's
@@ -31,17 +31,6 @@
   let deleting = $state(false);
   let error = $state<string | null>(null);
 
-  onMount(() => {
-    cancelButton?.focus();
-  });
-
-  function handleKeydown(e: KeyboardEvent) {
-    if (escapeShouldCancel(e.key, deleting)) {
-      e.preventDefault();
-      onCancel();
-    }
-  }
-
   async function confirmDelete() {
     if (deleting) return;
     deleting = true;
@@ -52,46 +41,36 @@
     const result = await runConfirmDelete(onConfirm);
     error = result.error;
     deleting = false;
+    // Post-error re-focus (PR 12 triage item): on failure the modal stays
+    // open with the error visible, but both buttons had just been disabled
+    // (mid-`deleting`) and re-enabled — return focus to Cancel explicitly
+    // rather than leaving it stranded on whatever had focus before the
+    // click (or nowhere, if the browser dropped it when Delete/Cancel
+    // became disabled).
+    if (error) cancelButton?.focus();
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
-<div class="backdrop">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-title" tabindex="-1">
-    <h2 id="delete-title">Delete file</h2>
-    <p>“{name}” will be permanently deleted. This can't be undone.</p>
-    {#if error}
-      <p class="error" role="alert">{error}</p>
-    {/if}
-    <div class="actions">
-      <button class="danger" onclick={confirmDelete} disabled={deleting}>
-        {deleting ? "Deleting…" : "Delete"}
-      </button>
-      <button class="ghost" bind:this={cancelButton} onclick={onCancel} disabled={deleting}>Cancel</button>
-    </div>
+<ModalBase
+  labelledBy="delete-title"
+  onClose={onCancel}
+  closeOnEscape={escapeShouldCancel("Escape", deleting)}
+  getInitialFocus={() => cancelButton}
+>
+  <h2 id="delete-title">Delete file</h2>
+  <p>“{name}” will be permanently deleted. This can't be undone.</p>
+  {#if error}
+    <p class="error" role="alert">{error}</p>
+  {/if}
+  <div class="actions">
+    <button class="danger" onclick={confirmDelete} disabled={deleting}>
+      {deleting ? "Deleting…" : "Delete"}
+    </button>
+    <button class="ghost" bind:this={cancelButton} onclick={onCancel} disabled={deleting}>Cancel</button>
   </div>
-</div>
+</ModalBase>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: grid;
-    place-items: center;
-    z-index: 100;
-  }
-  .modal {
-    width: min(380px, 92vw);
-    background: var(--surface);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.4);
-    padding: 20px;
-    display: grid;
-    gap: 10px;
-  }
   h2 {
     margin: 0;
     font-size: 15px;
