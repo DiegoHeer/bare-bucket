@@ -1,6 +1,6 @@
-// Upload engine building blocks (spec §5.1 / §7.4): pure helpers, unit-
-// tested. The XHR driver (exercised live, not unit-tested) lands in a
-// follow-up commit.
+// Upload engine building blocks (spec §5.1 / §7.4). Pure helpers first
+// (unit-tested); the XHR driver below is exercised live — `fetch` has no
+// upload-progress event, so PUTs go through `XMLHttpRequest`.
 
 /**
  * The first free variant of `name` given a set of already-taken names in
@@ -44,4 +44,65 @@ export function partRanges(size: number, partSize: number): PartRange[] {
     partNumber++;
   }
   return ranges;
+}
+
+export interface PutProgress {
+  (loadedBytes: number): void;
+}
+
+/**
+ * PUTs `body` to a presigned `url` via XHR (for upload-progress events,
+ * which `fetch` doesn't expose), reporting bytes loaded via `onProgress`.
+ * Resolves with the response's ETag header. Rejects on non-2xx (message
+ * includes the status), a missing ETag header, a network error, or abort
+ * (a `DOMException` named "AbortError", matching `fetch`'s convention so
+ * callers can branch on it the same way).
+ */
+export function putWithProgress(
+  url: string,
+  body: Blob,
+  contentType: string,
+  onProgress: PutProgress,
+  signal: AbortSignal,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("upload aborted", "AbortError"));
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url, true);
+    xhr.setRequestHeader("Content-Type", contentType);
+
+    const onAbort = () => xhr.abort();
+    signal.addEventListener("abort", onAbort);
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(e.loaded);
+    };
+    xhr.onload = () => {
+      cleanup();
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(`upload failed with status ${xhr.status}`));
+        return;
+      }
+      const etag = xhr.getResponseHeader("ETag");
+      if (!etag) {
+        reject(new Error("upload succeeded but the response is missing an ETag header"));
+        return;
+      }
+      resolve(etag);
+    };
+    xhr.onerror = () => {
+      cleanup();
+      reject(new Error("network error during upload"));
+    };
+    xhr.onabort = () => {
+      cleanup();
+      reject(new DOMException("upload aborted", "AbortError"));
+    };
+    xhr.send(body);
+  });
 }

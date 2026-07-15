@@ -40,6 +40,25 @@ export interface ReconcileReport {
   conditional: boolean;
 }
 
+// Upload surface (PR 10). `WasmClient`'s upload_plan/presign_put/
+// presign_upload_part return `any` from the generated .d.ts (serde-erased
+// at the wasm boundary) — these mirror wasm_api.rs's Serializable* shapes
+// so call sites can cast instead of re-declaring the shape ad hoc.
+export type UploadPlan =
+  | { kind: "single" }
+  | { kind: "multipart"; part_size: number; part_count: number };
+
+export interface PresignedRequest {
+  method: string;
+  url: string;
+  expires_secs: number;
+}
+
+export interface HeadResult {
+  etag: string;
+  size: number;
+}
+
 let initialized: Promise<void> | null = null;
 
 /** Idempotent wasm module initialization. */
