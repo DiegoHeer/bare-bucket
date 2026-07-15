@@ -183,6 +183,7 @@ impl S3Client {
                 .header("authorization", auth)
                 .header("x-amz-content-sha256", &payload_hash)
                 .header("x-amz-date", &timestamp);
+            request = no_store(request);
             for (name, value) in extra_headers {
                 request = request.header(*name, *value);
             }
@@ -332,6 +333,34 @@ impl S3Client {
             .map_err(|_| S3Error::InvalidResponse("invalid content-length header".into()))?;
         Ok(Some(HeadResult { etag, size }))
     }
+}
+
+/// Force every signed request to bypass the browser's HTTP cache on wasm.
+///
+/// In a browser, `reqwest` sends requests through `fetch`, which is subject
+/// to the ordinary HTTP cache — including for our signed API calls. Every
+/// operation on a given key (manifest GET, LIST, HEAD) hits the exact same
+/// URL, and providers like MinIO don't send `Cache-Control` on these
+/// responses, so the browser is free to serve a cached copy instead of
+/// making the request at all (observable as `transferSize: 0` in the
+/// performance entries — the request never reaches the origin). For a plain
+/// read that's merely stale data; for [`Self::send`]'s retry loop it's fatal:
+/// a conditional PUT's 412 causes a re-`GET` of the manifest to refresh the
+/// ETag, but the cached response returns the *same* stale ETag every time,
+/// so every retry 412s again and `update_with_retry` exhausts its budget
+/// (spec §4.2) even though the object on the server is fine. LIST and HEAD
+/// have the same failure mode for reconcile and out-of-band conflict checks.
+/// `fetch_cache_no_store` sets the request's cache mode to `no-store`,
+/// forcing every signed request to actually hit the network. This has no
+/// effect on the native target, where `reqwest` never goes through `fetch`.
+#[cfg(target_arch = "wasm32")]
+fn no_store(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request.fetch_cache_no_store()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn no_store(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request
 }
 
 async fn sleep_ms(ms: u64) {
