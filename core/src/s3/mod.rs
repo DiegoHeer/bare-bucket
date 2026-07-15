@@ -7,9 +7,13 @@
 
 pub mod error;
 mod list;
+mod multipart;
 
 pub use error::S3Error;
 pub use list::{ListPage, ObjectInfo};
+pub use multipart::{
+    plan_upload, PresignedRequest, UploadPlan, DEFAULT_PART_SIZE, MAX_PARTS, MULTIPART_THRESHOLD,
+};
 
 use crate::signer::{
     authorization_header, canonical_query_string, sha256_hex, sign, uri_encode, CanonicalRequest,
