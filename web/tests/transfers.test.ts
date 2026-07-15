@@ -7,7 +7,7 @@
 // wasm client or network, with deterministic promise resolution standing in
 // for real async I/O timing.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { engineDeps, transfers } from "../src/lib/transfers.svelte";
+import { engineDeps, keysInStatus, transfers, type Transfer } from "../src/lib/transfers.svelte";
 import { session } from "../src/lib/session.svelte";
 import type { PresignedRequest, WasmClient } from "../src/lib/core";
 
@@ -518,5 +518,64 @@ describe("transfers engine", () => {
     expect(transfers.items.filter((t) => t.direction === "upload" && t.status === "done")).toHaveLength(1);
     expect(download.status).toBe("downloading");
     expect(presignGetMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// PR 12 [B7]: shared basis for both the upload conflict pipeline's in-flight
+// set and delete's in-flight guard — a plain, pure function over an
+// explicit `items` array, so no reactive `transfers.items` state or engine
+// wiring is needed to exercise it.
+function fakeTransfer(key: string, status: Transfer["status"]): Transfer {
+  return {
+    id: crypto.randomUUID(),
+    key,
+    name: key,
+    size: 10,
+    kind: "single",
+    direction: status === "downloading" ? "download" : "upload",
+    status,
+    transferred: 0,
+    error: null,
+    uploadId: null,
+  };
+}
+
+describe("keysInStatus", () => {
+  it("collects keys whose status is in the given list", () => {
+    const items = [fakeTransfer("a.txt", "uploading"), fakeTransfer("b.txt", "done")];
+    expect(keysInStatus(items, ["uploading", "queued"])).toEqual(["a.txt"]);
+  });
+
+  it("supports the conflict pipeline's set (queued/uploading/paused)", () => {
+    const items = [
+      fakeTransfer("a.txt", "queued"),
+      fakeTransfer("b.txt", "uploading"),
+      fakeTransfer("c.txt", "paused"),
+      fakeTransfer("d.txt", "downloading"),
+      fakeTransfer("e.txt", "done"),
+      fakeTransfer("f.txt", "error"),
+      fakeTransfer("g.txt", "cancelled"),
+    ];
+    expect(keysInStatus(items, ["queued", "uploading", "paused"]).sort()).toEqual([
+      "a.txt",
+      "b.txt",
+      "c.txt",
+    ]);
+  });
+
+  it("supports delete's wider set, which additionally includes downloading", () => {
+    const items = [
+      fakeTransfer("a.txt", "queued"),
+      fakeTransfer("d.txt", "downloading"),
+      fakeTransfer("e.txt", "done"),
+    ];
+    expect(keysInStatus(items, ["queued", "uploading", "paused", "downloading"]).sort()).toEqual([
+      "a.txt",
+      "d.txt",
+    ]);
+  });
+
+  it("returns an empty array for no matches", () => {
+    expect(keysInStatus([fakeTransfer("a.txt", "done")], ["uploading"])).toEqual([]);
   });
 });

@@ -6,9 +6,10 @@
   import FileGrid from "../components/FileGrid.svelte";
   import TransferPanel from "../components/TransferPanel.svelte";
   import ConflictModal from "../components/ConflictModal.svelte";
+  import DeleteConfirmModal from "../components/DeleteConfirmModal.svelte";
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
-  import { transfers } from "../lib/transfers.svelte";
+  import { transfers, keysInStatus } from "../lib/transfers.svelte";
   import { anchorDownload, pickSaveTarget, supportsFsa } from "../lib/download";
   import { folderLabel, hasConflict, takenNamesInPrefix } from "../lib/conflicts";
   import {
@@ -35,20 +36,30 @@
     prefix: string;
   }
 
+  interface PendingDelete {
+    key: string;
+    name: string;
+  }
+
   let fileInput: HTMLInputElement | undefined = $state();
   let contentEl: HTMLDivElement | undefined = $state();
   let isDragging = $state(false);
   let conflictQueue = $state<QueuedConflict[]>([]);
   const currentConflict = $derived(conflictQueue[0] ?? null);
+  let pendingDelete = $state<PendingDelete | null>(null);
 
   // Transfer keys still actually "in flight" — a cancelled or errored-out
   // transfer never lands, so its key doesn't occupy anything. Shared by
   // both the conflict check below and the taken-names set handed to the
   // modal (same set, same reasoning).
-  const inFlightKeys = $derived(
-    transfers.items
-      .filter((t) => t.status === "queued" || t.status === "uploading" || t.status === "paused")
-      .map((t) => t.key),
+  const inFlightKeys = $derived(keysInStatus(transfers.items, ["queued", "uploading", "paused"]));
+
+  // [B7] Delete's in-flight guard is a superset of the conflict pipeline's
+  // set above (also blocks a key that's mid-download) — same underlying
+  // helper, just a wider status list, so the two can't define "in flight"
+  // differently by accident.
+  const deleteBlockedKeys = $derived(
+    new Set(keysInStatus(transfers.items, ["queued", "uploading", "paused", "downloading"])),
   );
 
   /** Routes a batch of dropped/picked files through the conflict pipeline
@@ -143,6 +154,28 @@
   }
   function resolveCancel() {
     conflictQueue = conflictQueue.slice(1);
+  }
+
+  /** Opens the delete confirm modal for `file` (spec §7.6, [B9]) — wired to
+   * the FileList/FileGrid row action. */
+  function requestDelete(file: ManifestObject) {
+    pendingDelete = { key: file.key, name: displayName(file.key).name };
+  }
+  function cancelDelete() {
+    pendingDelete = null;
+  }
+  /** Awaited BY the modal, not here: a rejection (object-delete failure,
+   * reserved prefix, manifest-conflict exhaustion) propagates back through
+   * this same promise, so the modal's own try/catch shows the error and
+   * keeps itself open [B10] — `pendingDelete` is only cleared below, on the
+   * success path, which is what actually closes the modal. Deleting the
+   * last file in a folder relies on the existing stale-prefix ancestor
+   * fallback effect further down (PR 9) once the manifest reflects the
+   * tombstone. */
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    await session.deleteObject(pendingDelete.key);
+    pendingDelete = null;
   }
 
   const listing = $derived(childEntries(session.manifest?.objects ?? [], browse.prefix));
@@ -260,16 +293,22 @@
       >
         {#if browse.section === "all"}
           {#if browse.view === "list"}
-            <FileList {listing} onDownload={downloadFile} />
+            <FileList {listing} onDownload={downloadFile} onDelete={requestDelete} {deleteBlockedKeys} />
           {:else}
-            <FileGrid {listing} onDownload={downloadFile} />
+            <FileGrid {listing} onDownload={downloadFile} onDelete={requestDelete} {deleteBlockedKeys} />
           {/if}
           {#if listing.folders.length === 0 && listing.files.length === 0}
             <p class="empty">This folder is empty.</p>
           {/if}
         {:else}
           <p class="section-count">{sectionFiles.length} result{sectionFiles.length === 1 ? "" : "s"}</p>
-          <FileList files={sectionFiles} showPath onDownload={downloadFile} />
+          <FileList
+            files={sectionFiles}
+            showPath
+            onDownload={downloadFile}
+            onDelete={requestDelete}
+            {deleteBlockedKeys}
+          />
           {#if sectionFiles.length === 0}
             <p class="empty">{sectionEmptyMessage}</p>
           {/if}
@@ -301,6 +340,12 @@
       onSaveAsCopy={resolveSaveAsCopy}
       onCancel={resolveCancel}
     />
+  {/key}
+{/if}
+
+{#if pendingDelete}
+  {#key pendingDelete.key}
+    <DeleteConfirmModal name={pendingDelete.name} onConfirm={confirmDelete} onCancel={cancelDelete} />
   {/key}
 {/if}
 

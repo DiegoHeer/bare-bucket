@@ -109,6 +109,17 @@ const CANCEL_POLL_MS = 100; // tick size for interruptible backoff sleeps during
 
 const internals = new Map<string, InternalState>();
 
+/** Keys currently occupied by a transfer whose status is in `statuses` —
+ * shared basis for both the upload conflict pipeline's in-flight set
+ * (queued/uploading/paused) and delete's in-flight guard [B7]
+ * (queued/uploading/paused/downloading), so the two call sites can't drift
+ * on what counts as "in flight"; only the status list passed in differs.
+ * Pure and takes `items` explicitly (rather than reading `transfers.items`
+ * itself) so it's trivially unit-testable without touching reactive state. */
+export function keysInStatus(items: Transfer[], statuses: Transfer["status"][]): string[] {
+  return items.filter((t) => statuses.includes(t.status)).map((t) => t.key);
+}
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }

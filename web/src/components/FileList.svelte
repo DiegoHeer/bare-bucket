@@ -11,6 +11,10 @@
   // file's parent path instead of relying on the current prefix.
   type Props = ({ listing: Listing; showPath?: false } | { files: ManifestObject[]; showPath: true }) & {
     onDownload: (file: ManifestObject) => void;
+    onDelete: (file: ManifestObject) => void;
+    /** Keys with an in-flight transfer (queued/uploading/paused/downloading)
+     * [B7] — the row's delete button is disabled for these. */
+    deleteBlockedKeys: Set<string>;
   };
 
   let props: Props = $props();
@@ -34,8 +38,10 @@
   </thead>
   <tbody>
     {#each folders as folder (folder.prefix)}
-      <tr class="clickable" onclick={() => browse.navigate(folder.prefix)}>
-        <td class="name">📁 {folder.name}</td>
+      <tr class="folder-row">
+        <td class="name">
+          <button class="row-button" onclick={() => browse.navigate(folder.prefix)}>📁 {folder.name}</button>
+        </td>
         <td class="num">—</td>
         <td class="num"></td>
         <td class="actions-col"></td>
@@ -77,6 +83,16 @@
               void session.toggleFavorite(file.key);
             }}
           >{file.favorite ? "★" : "☆"}</button>
+          <button
+            class="delete"
+            aria-label={`Delete ${fileName(file.key)}`}
+            title={props.deleteBlockedKeys.has(file.key) ? "Can't delete while a transfer is in progress" : "Delete"}
+            disabled={props.deleteBlockedKeys.has(file.key)}
+            onclick={(e) => {
+              e.stopPropagation();
+              props.onDelete(file);
+            }}
+          >🗑</button>
         </td>
       </tr>
     {/each}
@@ -129,12 +145,25 @@
   }
   th.actions-col,
   td.actions-col {
-    width: 54px;
+    width: 78px;
     padding: 8px 6px;
     white-space: nowrap;
   }
+  .row-button {
+    display: block;
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
   .star,
-  .download {
+  .download,
+  .delete {
     background: none;
     border: none;
     color: var(--text-dim);
@@ -152,10 +181,14 @@
   .download:hover {
     color: var(--accent);
   }
-  tr.clickable {
-    cursor: pointer;
+  .delete:hover:not(:disabled) {
+    color: var(--danger);
   }
-  tr.clickable:hover td {
+  .delete:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  tr.folder-row:hover td {
     background: var(--surface);
   }
 </style>
