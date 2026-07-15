@@ -11,7 +11,29 @@
 // data.
 import { partRanges, putWithProgress, type PartRange, type PutProgress } from "./upload";
 import { session } from "./session.svelte";
+import { previewKind } from "./preview";
+import { generateThumbFor, uploadThumb } from "./thumbs";
 import type { PresignedRequest, UploadPlan, WasmClient } from "./core";
+
+// Mirrors core/src/manifest.rs's `RESERVED_PREFIX` ([B10]) — no shared
+// export exists across the wasm boundary for it (it's a plain string
+// constant, not manifest-mutation logic), so it's duplicated here, same
+// convention as this module's other standalone constants.
+const RESERVED_PREFIX = ".bare-bucket/";
+
+/** [B5][B10] Decides whether a just-finished upload should trigger the
+ * on-upload thumbnail hook: kind must be image/pdf (per `previewKind`) and
+ * the key must not be under the reserved prefix. Pulled out as a pure,
+ * directly-testable function — rather than folded into `finalize` — so
+ * engine tests can assert the hook is skipped entirely for non-previewable
+ * kinds/reserved keys without needing to fake canvas/pdf.js internals (see
+ * `engineDeps.generateAndUploadThumb`, the seam for the part that DOES need
+ * faking). */
+export function shouldGenerateThumb(key: string, contentType: string): boolean {
+  if (key.startsWith(RESERVED_PREFIX)) return false;
+  const kind = previewKind({ key, content_type: contentType });
+  return kind === "image" || kind === "pdf";
+}
 
 /** Indirection seam for the engine's live-only dependencies — the XHR PUT
  * driver, the download presign + fetch calls, and "the currently connected
@@ -39,6 +61,24 @@ export const engineDeps = {
   },
   /** [B10] Wraps `fetch` for the download reader loop. */
   fetchStream: (url: string, signal: AbortSignal): Promise<Response> => fetch(url, { signal }),
+  /** [B5] The real on-upload thumbnail pipeline: generate from the local
+   * `File` (no re-download), upload it, `set_thumbnail`, then mirror the
+   * change onto the live manifest row. `finalize()` only calls this once
+   * `shouldGenerateThumb` (a plain function, not part of this seam) has
+   * already said yes — kept behind `engineDeps` anyway so tests can swap in
+   * a controllable mock without touching canvas/createImageBitmap/pdf.js,
+   * matching every other live-only dependency in this object. */
+  generateAndUploadThumb: async (
+    client: WasmClient,
+    key: string,
+    contentType: string,
+    file: File,
+  ): Promise<void> => {
+    const kind = previewKind({ key, content_type: contentType }) as "image" | "pdf"; // caller already gated via shouldGenerateThumb
+    const blob = await generateThumbFor(kind, file);
+    const { thumbnailKey, updated } = await uploadThumb(client, key, blob);
+    if (updated) session.applyThumbnail(key, thumbnailKey);
+  },
 };
 
 export interface Transfer {
@@ -236,20 +276,36 @@ async function finalize(
   etag: string,
 ): Promise<void> {
   if (internal.cancelled) return; // Complete succeeded but the user cancelled — leave status "cancelled"; the object exists remotely and the next refresh surfaces it
+  // Captured before `freeInternal()` nulls `internal.file` below — the
+  // on-upload thumbnail hook needs the LOCAL file's bytes (no re-download,
+  // per plan [B5]), so it must be grabbed before the terminal-state cleanup
+  // that follows a successful upsert.
+  const file = internal.file;
+  const contentType = internal.contentType;
   try {
-    await client.upsert_object(transfer.key, transfer.size, etag, internal.contentType);
+    await client.upsert_object(transfer.key, transfer.size, etag, contentType);
     session.applyUpsert({
       key: transfer.key,
       size: transfer.size,
       etag,
       last_modified: new Date().toISOString(),
-      content_type: internal.contentType,
+      content_type: contentType,
       favorite: false,
       thumbnail_key: null,
       deleted_at: null,
     });
     transfer.status = "done";
     freeInternal(transfer.id);
+    // [B5] Fired AFTER the transfer has already settled to "done" so a
+    // slow or failing thumbnail pipeline never delays or errors the upload
+    // itself; any rejection is swallowed here (console.warn only) rather
+    // than touching the transfer row, which is the whole point of the
+    // non-fatal contract.
+    if (file && shouldGenerateThumb(transfer.key, contentType)) {
+      void engineDeps.generateAndUploadThumb(client, transfer.key, contentType, file).catch((e) => {
+        console.warn(`thumbnail generation failed for "${transfer.key}":`, e);
+      });
+    }
   } catch (e) {
     transfer.status = "error";
     transfer.error = `upload finished but failed to record it: ${errMsg(e)}`;
