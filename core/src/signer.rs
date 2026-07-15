@@ -103,18 +103,36 @@ pub struct Signature {
 
 /// Lowercased, sorted `name:trimmed-value\n` block plus the `;`-joined
 /// signed-headers list.
+/// Note: `str::trim` trims Unicode whitespace, slightly broader than the
+/// spec's space-only Trimall; irrelevant here because this client controls
+/// every header value it signs.
 fn canonicalize_headers(headers: &[(&str, &str)]) -> (String, String) {
     let mut pairs: Vec<(String, &str)> = headers
         .iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), value.trim()))
         .collect();
     pairs.sort();
+    debug_assert!(
+        pairs.windows(2).all(|w| w[0].0 != w[1].0),
+        "duplicate header names must be merged before signing"
+    );
     let canonical: String = pairs
         .iter()
         .map(|(name, value)| format!("{name}:{value}\n"))
         .collect();
     let signed: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
     (canonical, signed.join(";"))
+}
+
+/// First 8 chars (YYYYMMDD) of an ISO8601-basic timestamp, with a guard that
+/// turns a malformed caller-supplied timestamp into a diagnosable panic
+/// instead of a byte-slice trap in WASM.
+fn scope_date(timestamp: &str) -> &str {
+    assert!(
+        timestamp.len() >= 8 && timestamp.is_char_boundary(8),
+        "timestamp must be ISO8601 basic, e.g. 20130524T000000Z"
+    );
+    &timestamp[..8]
 }
 
 pub fn sign(ctx: &SigningContext, req: &CanonicalRequest) -> Signature {
@@ -128,7 +146,7 @@ pub fn sign(ctx: &SigningContext, req: &CanonicalRequest) -> Signature {
         signed_headers,
         req.payload_hash,
     );
-    let date = &ctx.timestamp[..8];
+    let date = scope_date(ctx.timestamp);
     let credential_scope = format!("{date}/{}/{}/aws4_request", ctx.region, ctx.service);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{credential_scope}\n{}",
@@ -167,10 +185,14 @@ pub fn presign_query(
     extra_query: &[(&str, &str)],
     expires_secs: u64,
 ) -> String {
+    debug_assert!(
+        extra_query.iter().all(|(k, _)| !k.starts_with("X-Amz-")),
+        "extra_query must not contain reserved X-Amz-* parameters"
+    );
     let credential = format!(
         "{}/{}/{}/{}/aws4_request",
         ctx.credentials.access_key_id,
-        &ctx.timestamp[..8],
+        scope_date(ctx.timestamp),
         ctx.region,
         ctx.service,
     );
@@ -200,7 +222,7 @@ pub fn presign_query(
 
 #[cfg(test)]
 mod tests {
-    use crate::signer::*;
+    use super::*;
 
     #[test]
     fn uri_encode_keeps_unreserved_characters() {
@@ -252,9 +274,8 @@ mod tests {
 
     #[test]
     fn signing_key_derivation_chain() {
-        // Derived key for the shared AWS example inputs; verified end-to-end
-        // by the full signature vectors in Task 2 — here we assert the chain
-        // is deterministic and 32 bytes (HMAC-SHA256 output).
+        // The pinned hex is the AWS-documented derived signing key for the
+        // shared example inputs (independently verified during review).
         let key = signing_key(
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             "20130524",
