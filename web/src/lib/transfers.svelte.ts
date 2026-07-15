@@ -144,7 +144,12 @@ interface InternalState {
 
 const MAX_CONCURRENT_FILES = 3;
 const MAX_CONCURRENT_PARTS = 3;
-const PRESIGN_EXPIRES_SECS = 3600;
+// Polish item 2: the one exported copy of this constant — BrowseScreen.svelte
+// imports it instead of keeping its own local duplicate. The other sites
+// (GridThumb.svelte/Lightbox.svelte/generateMissing.svelte.ts/thumbs.ts) keep
+// their own copies per their own comments; consolidating those is out of
+// this fix's scope.
+export const PRESIGN_EXPIRES_SECS = 3600;
 const COMPLETE_RETRY_DELAYS_MS = [1000, 2000]; // [B2]: 3 attempts total, 1s/2s backoff between them
 const CANCEL_POLL_MS = 100; // tick size for interruptible backoff sleeps during Complete retry
 

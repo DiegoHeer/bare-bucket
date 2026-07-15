@@ -53,8 +53,11 @@ function deviceId(): string {
 }
 
 /** Network-shaped failures from the browser usually mean missing bucket
- * CORS rules — the #1 setup failure (spec §8.4). */
-function describeError(e: unknown): string {
+ * CORS rules — the #1 setup failure (spec §8.4). Exported (polish item 3) so
+ * BrowseScreen.svelte's downloadFile can format its own failures the same
+ * way before surfacing them through `session.refreshError`'s existing
+ * inline-banner/chip affordance, rather than growing a second error format. */
+export function describeError(e: unknown): string {
   const message = e instanceof Error ? e.message : String(e);
   if (/network error|failed to fetch|networkerror/i.test(message)) {
     return `${message} — if the endpoint is reachable, your bucket is likely missing CORS rules; see the setup docs.`;
