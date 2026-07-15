@@ -155,6 +155,49 @@ pub fn authorization_header(ctx: &SigningContext, sig: &Signature) -> String {
     )
 }
 
+/// Query string for a presigned URL (SigV4 query-parameter auth). The
+/// returned string includes `X-Amz-Signature`; the caller appends it to
+/// `https://{host}{uri_path}?`. Only the `host` header is signed, and the
+/// payload is unsigned — the standard shape for browser-consumable links.
+pub fn presign_query(
+    ctx: &SigningContext,
+    method: &str,
+    uri_path: &str,
+    host: &str,
+    extra_query: &[(&str, &str)],
+    expires_secs: u64,
+) -> String {
+    let credential = format!(
+        "{}/{}/{}/{}/aws4_request",
+        ctx.credentials.access_key_id,
+        &ctx.timestamp[..8],
+        ctx.region,
+        ctx.service,
+    );
+    let expires = expires_secs.to_string();
+    let mut query: Vec<(&str, &str)> = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", &credential),
+        ("X-Amz-Date", ctx.timestamp),
+        ("X-Amz-Expires", &expires),
+        ("X-Amz-SignedHeaders", "host"),
+    ];
+    query.extend_from_slice(extra_query);
+    let req = CanonicalRequest {
+        method,
+        uri_path,
+        query: &query,
+        headers: &[("host", host)],
+        payload_hash: UNSIGNED_PAYLOAD,
+    };
+    let sig = sign(ctx, &req);
+    format!(
+        "{}&X-Amz-Signature={}",
+        canonical_query_string(&query),
+        sig.signature
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::signer::*;
@@ -344,5 +387,50 @@ mod tests {
             sign(&ctx, &req).signature,
             "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
         );
+    }
+
+    // AWS "Example: Presigned URL" vector (GET /test.txt, 24h expiry).
+    #[test]
+    fn presigns_get_object_url() {
+        let credentials = example_credentials();
+        let ctx = example_context(&credentials);
+        let query = presign_query(
+            &ctx,
+            "GET",
+            "/test.txt",
+            "examplebucket.s3.amazonaws.com",
+            &[],
+            86400,
+        );
+        assert_eq!(
+            query,
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+             &X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Date=20130524T000000Z\
+             &X-Amz-Expires=86400\
+             &X-Amz-SignedHeaders=host\
+             &X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+        );
+    }
+
+    #[test]
+    fn presign_carries_extra_query_parameters() {
+        let credentials = example_credentials();
+        let ctx = example_context(&credentials);
+        let query = presign_query(
+            &ctx,
+            "GET",
+            "/test.txt",
+            "examplebucket.s3.amazonaws.com",
+            &[("response-content-disposition", "attachment")],
+            3600,
+        );
+        assert!(query.contains("response-content-disposition=attachment"));
+        let signature = query
+            .rsplit_once("&X-Amz-Signature=")
+            .expect("signature must be the final parameter")
+            .1;
+        assert_eq!(signature.len(), 64);
+        assert!(signature.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
