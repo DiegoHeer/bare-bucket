@@ -21,6 +21,21 @@
 //!   complete, abort, list): `AllowedHeaders` must include `authorization`,
 //!   `x-amz-date`, and `x-amz-content-sha256` — the SigV4 headers this
 //!   client signs and sends on every request.
+//! - **Data-plane presigned GETs** ([`S3Client::presign_get`]), specifically
+//!   the ranged requests PR 13's lightbox text preview issues against them:
+//!   `AllowedHeaders` must include `Range` (the browser only exempts
+//!   CORS-safelisted request headers from needing explicit allowance, and
+//!   `Range` is not on that safelist) so the ranged `GET` isn't rejected by
+//!   preflight; `ExposeHeaders` must include `Content-Range` and
+//!   `Accept-Ranges` for the same reason on the response side — unlike
+//!   `Content-Length` (safelisted, always readable), `Content-Range` is not,
+//!   so without exposing it JS can't read back a 206 response's real object
+//!   total (needed for the preview's truncated-vs-not decision) and has to
+//!   fall back to the manifest's last-known size instead. Missing this
+//!   exposure doesn't break the preview outright — the ranged fetch itself
+//!   still works either way — but it does make the truncation notice a
+//!   manifest-size guess rather than a server-confirmed total. Validate
+//!   against MinIO live in PR 13; full per-provider CORS docs land in PR 15.
 
 use super::{S3Client, S3Error};
 use crate::signer::{presign_query, SigningContext};
