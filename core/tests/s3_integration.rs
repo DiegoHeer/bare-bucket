@@ -2,7 +2,7 @@
 //! `docker compose up -d`). Skipped unless BARE_BUCKET_IT=1.
 //!
 //! Run locally:
-//!   docker compose up -d --wait
+//!   docker compose up -d --wait minio && docker compose run --rm createbucket
 //!   BARE_BUCKET_IT=1 BARE_BUCKET_IT_ENDPOINT=http://127.0.0.1:9000 \
 //!     BARE_BUCKET_IT_REGION=us-east-1 BARE_BUCKET_IT_BUCKET=bare-bucket-it \
 //!     BARE_BUCKET_IT_ACCESS_KEY=baretest BARE_BUCKET_IT_SECRET_KEY=baretest123 \

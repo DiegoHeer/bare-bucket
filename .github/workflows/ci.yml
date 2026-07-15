@@ -44,7 +44,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: docker compose up -d --wait
+      - run: docker compose up -d --wait minio
+      - run: docker compose run --rm createbucket
       - run: cargo test -p bare-bucket-core --test s3_integration -- --nocapture
         env:
           BARE_BUCKET_IT: "1"
