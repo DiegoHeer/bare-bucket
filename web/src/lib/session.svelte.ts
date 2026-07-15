@@ -9,6 +9,14 @@ import {
 } from "./core";
 import type { Profile } from "./profiles";
 import { transfers } from "./transfers.svelte";
+// Polish items 10/11: session.disconnect()/connect() reset the "generate
+// missing thumbnails" runner's visible state. generateMissing.svelte.ts
+// already imports `session` (and `transfers`) itself, so this import is
+// mutually circular — same shape as the existing session.svelte.ts <->
+// transfers.svelte.ts pair above, which already works because both sides
+// only touch each other's exports from inside function bodies, never at
+// module-evaluation time.
+import { generateMissing } from "./generateMissing.svelte";
 
 interface Session {
   status: "connect" | "connected";
@@ -81,6 +89,11 @@ export const session: Session = $state({
     session.connecting = true;
     session.error = null;
     session.refreshError = null;
+    // Polish item 11: defensive reset in case a previous session's
+    // disconnect() didn't run through the normal teardown path (or a future
+    // call site forgets to) — a stale "Generating…"/summary from the last
+    // connection must never bleed into this one.
+    generateMissing.reset();
     let client: WasmClient | undefined;
     try {
       client = createClient({
@@ -145,6 +158,11 @@ export const session: Session = $state({
     } catch {
       /* mid-flight borrow; GC fallback */
     }
+    // Polish item 10: cancel + immediately reset an active generate-missing
+    // run — its client is being torn down right here, so it must not keep
+    // running (or keep showing a "Generating…" banner) against a session
+    // that's already gone.
+    generateMissing.reset();
     session.status = "connect";
     session.client = null; // drops the wasm instance and the secret with it
     session.manifest = null;

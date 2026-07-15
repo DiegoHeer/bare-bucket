@@ -67,9 +67,15 @@
       <button class="ghost" onclick={startGenerateMissing}>Generate missing thumbnails</button>
       {#if generateMissing.total > 0}
         <span class="thumbs-summary">
-          Generated {generateMissing.done}{generateMissing.failed > 0
-            ? `, ${generateMissing.failed} failed`
-            : ""}.
+          {#if generateMissing.cancelled}
+            Cancelled after {generateMissing.done} of {generateMissing.total}{generateMissing.failed > 0
+              ? `, ${generateMissing.failed} failed`
+              : ""}.
+          {:else}
+            Generated {generateMissing.done}{generateMissing.failed > 0
+              ? `, ${generateMissing.failed} failed`
+              : ""}.
+          {/if}
         </span>
       {/if}
     {/if}

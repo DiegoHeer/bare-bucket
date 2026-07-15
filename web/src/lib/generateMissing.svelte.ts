@@ -66,6 +66,7 @@ export const generateMissing: {
   cancelled: boolean;
   start(client: WasmClient, manifest: Manifest): Promise<void>;
   cancel(): void;
+  reset(): void;
 } = $state({
   running: false,
   total: 0,
@@ -132,5 +133,29 @@ export const generateMissing: {
    * `start`'s loop guard. */
   cancel() {
     generateMissing.cancelled = true;
+  },
+
+  /** Polish items 10/11: cancels an in-flight run (if any) AND immediately
+   * clears every visible field, rather than just `cancel()`'s "stop before
+   * the next item" — used around session teardown (disconnect/profile
+   * switch, and defensively again at the start of the next `connect()`) so a
+   * stale "Generating…" banner or a leftover done/failed summary from the
+   * PREVIOUS session never bleeds into the next one.
+   *
+   * Safe to call while `start()`'s loop is still actually unwinding in the
+   * background: the only thing an in-flight item could still be awaiting is
+   * the about-to-be-torn-down client, and each item already runs inside
+   * `start()`'s own per-item try/catch (a failure there is swallowed into
+   * `failed`, but nothing is reading these fields anymore once this has
+   * reset them to 0 and re-set `cancelled`). `start()`'s own `finally` will
+   * still run afterwards and re-set `running`/`currentKey` to the same
+   * values this already set — a harmless, idempotent no-op. */
+  reset() {
+    generateMissing.cancelled = true;
+    generateMissing.running = false;
+    generateMissing.total = 0;
+    generateMissing.done = 0;
+    generateMissing.failed = 0;
+    generateMissing.currentKey = null;
   },
 });

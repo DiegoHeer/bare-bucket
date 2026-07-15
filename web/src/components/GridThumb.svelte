@@ -72,10 +72,18 @@
 
 <span class="thumb" bind:this={root}>
   {#if url}
+    <!-- Polish item 9: decorative by design, not an oversight — the tile's
+         own caption (FileGrid.svelte's `.caption` span) already carries the
+         file name right next to this thumb, so the image would be a
+         redundant "photo.jpg" announcement for a screen reader. `alt=""`
+         alone already achieves that, but `aria-hidden` makes the intent
+         explicit and belt-and-suspenders against any AT that doesn't honor
+         an empty alt on its own. -->
     <img
       class="thumb-img"
       src={url}
       alt=""
+      aria-hidden="true"
       loading="lazy"
       onload={() => (thumbState = "loaded")}
       onerror={() => {

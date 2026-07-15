@@ -6,6 +6,7 @@
 // console.warn, never thrown).
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { session } from "../src/lib/session.svelte";
+import { generateMissing } from "../src/lib/generateMissing.svelte";
 import { childEntries, favoriteFiles } from "../src/lib/listing";
 import type { ManifestObject, WasmClient } from "../src/lib/core";
 
@@ -30,7 +31,41 @@ function fakeClient(deleteObject: (key: string) => Promise<unknown>): Pick<WasmC
 afterEach(() => {
   session.manifest = null;
   session.client = null;
+  generateMissing.running = false;
+  generateMissing.total = 0;
+  generateMissing.done = 0;
+  generateMissing.failed = 0;
+  generateMissing.currentKey = null;
+  generateMissing.cancelled = false;
   vi.restoreAllMocks();
+});
+
+describe("disconnect", () => {
+  it("cancels and resets an active generate-missing run (polish item 10)", () => {
+    session.client = { free: vi.fn() } as unknown as WasmClient;
+    session.status = "connected";
+    generateMissing.running = true;
+    generateMissing.total = 5;
+    generateMissing.done = 2;
+    generateMissing.currentKey = "a.png";
+
+    session.disconnect();
+
+    expect(generateMissing.running).toBe(false);
+    expect(generateMissing.total).toBe(0);
+    expect(generateMissing.done).toBe(0);
+    expect(generateMissing.currentKey).toBeNull();
+    expect(generateMissing.cancelled).toBe(true);
+    expect(session.status).toBe("connect");
+  });
+
+  it("is a no-op on generate-missing state when no run was active", () => {
+    session.client = null;
+    session.status = "connected";
+
+    expect(() => session.disconnect()).not.toThrow();
+    expect(generateMissing.total).toBe(0);
+  });
 });
 
 describe("applyTombstone", () => {
