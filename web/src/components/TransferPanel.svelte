@@ -6,10 +6,22 @@
 
   let collapsed = $state(false);
 
+  // Rows still meaningfully "in progress" — used both to decide whether the
+  // header shows an aggregate or falls back to a plain "Transfers" label.
+  const activeItems = $derived(
+    transfers.items.filter(
+      (t) => t.status === "queued" || t.status === "uploading" || t.status === "paused",
+    ),
+  );
+
+  // Cancelled/error rows never finish, so counting their size/uploaded bytes
+  // would permanently drag the aggregate below 100% even once every other
+  // row is done.
   const aggregatePercent = $derived.by(() => {
-    const totalSize = transfers.items.reduce((sum, t) => sum + t.size, 0);
+    const counted = transfers.items.filter((t) => t.status !== "cancelled" && t.status !== "error");
+    const totalSize = counted.reduce((sum, t) => sum + t.size, 0);
     if (totalSize === 0) return 100;
-    const totalUploaded = transfers.items.reduce((sum, t) => sum + t.uploaded, 0);
+    const totalUploaded = counted.reduce((sum, t) => sum + t.uploaded, 0);
     return Math.min(100, Math.round((totalUploaded / totalSize) * 100));
   });
 
@@ -32,12 +44,22 @@
   }
 
   // Pause/resume only ever applies to a multipart transfer still short of
-  // 100% — once the part loop finishes and Complete starts, the engine's
-  // `internal.completing` flag makes pause() a no-op, so hide the control
-  // once progress reaches full (mirrors that phase without exposing
-  // internal engine state to the UI).
+  // its full byte count — once the part loop finishes and Complete starts,
+  // the engine's `internal.completing` flag makes pause() a no-op, so hide
+  // the control once every byte is uploaded (mirrors that phase without
+  // exposing internal engine state to the UI). Gated on raw bytes rather
+  // than the rounded display percent so a 99.6%-rounds-to-100% row doesn't
+  // hide pause a beat before the part loop is actually done.
   function showPauseResume(t: Transfer): boolean {
-    return t.kind === "multipart" && (t.status === "uploading" || t.status === "paused") && percent(t) < 100;
+    return t.kind === "multipart" && (t.status === "uploading" || t.status === "paused") && t.uploaded < t.size;
+  }
+
+  // True during the Complete phase: every byte is uploaded but the row
+  // hasn't settled to "done" yet (Complete's retry/backoff can take a few
+  // seconds). Renders a "Finishing…" label instead of a progress bar —
+  // there's no more per-byte progress to show, and pause is a no-op here.
+  function isCompleting(t: Transfer): boolean {
+    return t.status === "uploading" && t.uploaded >= t.size;
   }
 
   function showCancel(t: Transfer): boolean {
@@ -49,7 +71,11 @@
   <div class="panel" class:collapsed>
     <div class="header">
       <span class="title">
-        Uploading {transfers.items.length} item{transfers.items.length === 1 ? "" : "s"} · {aggregatePercent}%
+        {#if activeItems.length === 0}
+          Transfers
+        {:else}
+          Uploading {transfers.items.length} item{transfers.items.length === 1 ? "" : "s"} · {aggregatePercent}%
+        {/if}
       </span>
       <button
         class="icon-btn"
@@ -73,6 +99,8 @@
             <span class="status">
               {#if t.status === "queued"}
                 <span class="label">Queued</span>
+              {:else if isCompleting(t)}
+                <span class="label">Finishing…</span>
               {:else if t.status === "uploading" || t.status === "paused"}
                 <span class="bar"><span class="fill" style="width: {percent(t)}%"></span></span>
                 <span class="pct">{percent(t)}%{t.status === "paused" ? " · Paused" : ""}</span>

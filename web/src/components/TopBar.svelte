@@ -1,11 +1,24 @@
 <script lang="ts">
   import { session } from "../lib/session.svelte";
   import { browse } from "../lib/browse.svelte";
+  import { transfers } from "../lib/transfers.svelte";
 
   // browse.reset() must happen before disconnect() clears the profile name —
   // session.disconnect() doesn't touch browse state itself to avoid a
   // circular import between session.svelte.ts and browse.svelte.ts.
-  function switchProfile() {
+  //
+  // If any upload is still queued/uploading/paused, confirm first — the
+  // about-to-be-torn-down client is what those transfers are presigning
+  // and completing against, so switching out from under them would just
+  // strand them. On confirmation, cancel them all before tearing down.
+  async function switchProfile() {
+    if (transfers.active) {
+      const proceed = confirm(
+        "Uploads are in progress — switching profiles cancels them. Continue?",
+      );
+      if (!proceed) return;
+      await transfers.cancelAll();
+    }
     browse.reset();
     session.disconnect();
   }
@@ -13,7 +26,7 @@
 
 <header>
   <span class="wordmark">▙ bare<span class="accent">bucket</span></span>
-  <button class="chip" title="Switch profile" onclick={switchProfile}>
+  <button class="chip" title="Switch profile" onclick={() => void switchProfile()}>
     {session.profileName} ▾
   </button>
   <span class="spacer"></span>

@@ -32,17 +32,28 @@
   let conflictQueue = $state<QueuedConflict[]>([]);
   const currentConflict = $derived(conflictQueue[0] ?? null);
 
+  // Transfer keys still actually "in flight" — a cancelled or errored-out
+  // transfer never lands, so its key doesn't occupy anything. Shared by
+  // both the conflict check below and the taken-names set handed to the
+  // modal (same set, same reasoning).
+  const inFlightKeys = $derived(
+    transfers.items
+      .filter((t) => t.status === "queued" || t.status === "uploading" || t.status === "paused")
+      .map((t) => t.key),
+  );
+
   /** Routes a batch of dropped/picked files through the conflict pipeline
    * (spec §8.3): files whose target key already names a live manifest
-   * object are queued for the modal (one at a time); everything else
-   * enqueues immediately. The target key snapshots `browse.prefix` now —
-   * later navigation never retargets an in-flight upload. */
+   * object, or an in-flight transfer's target, are queued for the modal
+   * (one at a time); everything else enqueues immediately. The target key
+   * snapshots `browse.prefix` now — later navigation never retargets an
+   * in-flight upload. */
   function handleFiles(files: globalThis.FileList | File[]) {
     const prefix = browse.prefix;
     const objects = session.manifest?.objects ?? [];
     for (const file of Array.from(files)) {
       const key = prefix + file.name;
-      if (hasConflict(objects, key)) {
+      if (hasConflict(objects, key, inFlightKeys)) {
         conflictQueue.push({ id: crypto.randomUUID(), file, key, prefix });
       } else {
         transfers.enqueue(file, key);
@@ -246,7 +257,7 @@
       targetKey={currentConflict.key}
       takenNames={takenNamesInPrefix(
         session.manifest?.objects ?? [],
-        transfers.items.map((t) => t.key),
+        inFlightKeys,
         currentConflict.prefix,
       )}
       onOverwrite={resolveOverwrite}

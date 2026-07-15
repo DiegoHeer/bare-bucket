@@ -23,7 +23,12 @@ export interface Transfer {
 }
 
 interface InternalState {
-  file: File;
+  /** Nulled once the transfer settles into a terminal status (done/error/
+   * cancelled) — see `freeInternal`. Only ever read while a run is active
+   * (before the terminal free), so reads elsewhere use `!` to assert
+   * non-null; that invariant is enforced by construction (nothing re-enters
+   * `runSingle`/`uploadPart` for a transfer that already left "uploading"). */
+  file: File | null;
   contentType: string;
   /** Remaining part ranges not yet dispatched (multipart only). */
   pending: PartRange[];
@@ -89,6 +94,31 @@ function recomputeUploaded(transfer: Transfer, internal: InternalState): void {
   let inFlight = 0;
   for (const loaded of internal.inFlightLoaded.values()) inFlight += loaded;
   transfer.uploaded = internal.completedBytes + inFlight;
+}
+
+/** Releases an item's heavy engine-only bookkeeping once its `Transfer.
+ * status` has settled into a terminal state ("done" | "error" |
+ * "cancelled") — the `File` handle, any `AbortController`s, and the
+ * per-part queue/progress data are never touched again for a terminal
+ * transfer, so drop the references and let the GC reclaim them (this
+ * matters for many-file, large-file sessions left in the panel via
+ * `clearFinished()` not yet having run). `Transfer.uploadId` lives on the
+ * reactive row itself (not here) and is deliberately left alone — it's
+ * still useful for diagnostics after the row settles.
+ *
+ * Must only be called as the LAST step of whichever branch finally settles
+ * a transfer — `abortEagerly` and `cancel()`'s own abort call still need
+ * `internal.completed`/`internal.controllers` to do their job, so this runs
+ * after them, never before. Safe to call more than once and safe if some
+ * fields were already read earlier in that same settling branch. */
+function freeInternal(id: string): void {
+  const internal = internals.get(id);
+  if (!internal) return;
+  internal.file = null;
+  internal.controllers.clear();
+  internal.inFlightLoaded.clear();
+  internal.pending = [];
+  internal.completedParts = [];
 }
 
 /** Retries `complete_multipart_upload` up to 3 times (1s/2s backoff)
@@ -167,9 +197,11 @@ async function finalize(
       deleted_at: null,
     });
     transfer.status = "done";
+    freeInternal(transfer.id);
   } catch (e) {
     transfer.status = "error";
     transfer.error = `upload finished but failed to record it: ${errMsg(e)}`;
+    freeInternal(transfer.id);
   }
 }
 
@@ -185,7 +217,7 @@ async function runSingle(
     const presigned = client.presign_put(transfer.key, PRESIGN_EXPIRES_SECS) as PresignedRequest;
     const etag = await putWithProgress(
       presigned.url,
-      internal.file,
+      internal.file!, // set at enqueue(), only nulled after this transfer is terminal
       internal.contentType,
       (loaded) => {
         transfer.uploaded = loaded;
@@ -193,12 +225,17 @@ async function runSingle(
       controller.signal,
     );
     internal.controllers.delete(controller);
+    // The final upload-progress event isn't guaranteed to report the full
+    // byte count before `onload` fires — assert it explicitly so the panel
+    // never shows a stuck sub-100% bar for a transfer that's actually done.
+    transfer.uploaded = transfer.size;
     await finalize(client, transfer, internal, etag);
   } catch (e) {
     internal.controllers.delete(controller);
     if (internal.cancelled) return; // cancel() already set status + message
     transfer.status = "error";
     transfer.error = errMsg(e);
+    freeInternal(transfer.id);
   }
 }
 
@@ -223,7 +260,7 @@ async function uploadPart(
         part.partNumber,
         PRESIGN_EXPIRES_SECS,
       ) as PresignedRequest;
-      const blob = internal.file.slice(part.start, part.end);
+      const blob = internal.file!.slice(part.start, part.end); // set at enqueue(), only nulled after this transfer is terminal
       const etag = await putWithProgress(
         presigned.url,
         blob,
@@ -262,6 +299,7 @@ async function runMultipart(
     } catch (e) {
       transfer.status = "error";
       transfer.error = errMsg(e);
+      freeInternal(transfer.id);
       return;
     }
   }
@@ -305,6 +343,7 @@ async function runMultipart(
     transfer.status = "error";
     transfer.error = errMsg(failure);
     await abortEagerly(client, transfer, internal); // per-part retries exhausted: give up on the upload
+    freeInternal(transfer.id);
     return;
   }
 
@@ -320,6 +359,7 @@ async function runMultipart(
     transfer.status = "error";
     transfer.error = errMsg(e);
     await abortEagerly(client, transfer, internal); // Complete retries exhausted: give up on the upload
+    freeInternal(transfer.id);
   }
 }
 
@@ -372,6 +412,7 @@ export const transfers: {
   pause(id: string): void;
   resume(id: string): void;
   cancel(id: string): Promise<void>;
+  cancelAll(): Promise<void>;
   clearFinished(): void;
 } = $state({
   items: [],
@@ -495,6 +536,20 @@ export const transfers: {
         }
       }
     }
+    freeInternal(id);
+  },
+
+  /** Cancels every non-terminal transfer (queued/uploading/paused) —
+   * e.g. when switching profiles, where letting uploads keep running
+   * against the about-to-be-torn-down session/client makes no sense.
+   * Snapshots the id list before cancelling since `cancel()` mutates
+   * `transfers.items` (via `pump()`) as it goes. Reuses `cancel(id)` so
+   * every abort/status/error-note rule stays in exactly one place. */
+  async cancelAll() {
+    const ids = transfers.items
+      .filter((t) => t.status === "queued" || t.status === "uploading" || t.status === "paused")
+      .map((t) => t.id);
+    await Promise.all(ids.map((id) => transfers.cancel(id)));
   },
 
   clearFinished() {
@@ -516,6 +571,9 @@ if (typeof window !== "undefined") {
   window.addEventListener("beforeunload", (e) => {
     if (transfers.active) {
       e.preventDefault();
+      // Legacy contract some browsers still require alongside
+      // preventDefault() to actually show the "leave site?" prompt.
+      e.returnValue = "";
     }
   });
 }
