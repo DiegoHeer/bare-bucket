@@ -30,6 +30,9 @@ export function childEntries(objects: ManifestObject[], prefix: string): Listing
       files.push(object);
     } else {
       const name = rest.slice(0, slash);
+      // S3 permits keys with "//" or a leading "/", which would otherwise
+      // render a blank, clickable folder row.
+      if (!name) continue;
       if (!folders.has(name)) {
         folders.set(name, { name, prefix: `${prefix}${name}/` });
       }

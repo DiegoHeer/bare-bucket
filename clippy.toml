@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "serde_wasm_bindgen::to_value", reason = "use wasm_api::to_js (json_compatible) so Option::None crosses as null" },
+]

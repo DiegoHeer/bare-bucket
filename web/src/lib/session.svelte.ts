@@ -13,7 +13,6 @@ interface Session {
   lastReport: ReconcileReport | null;
   refreshError: string | null;
   connect(profile: Profile, secretAccessKey: string): Promise<void>;
-  refreshManifest(): Promise<void>;
   refresh(): Promise<void>;
   disconnect(): void;
   clearError(): void;
@@ -73,7 +72,9 @@ export const session: Session = $state({
         deviceId: deviceId(),
       });
       await client.validate();
-      await client.reconcile([]); // refresh-on-open + first-connect bootstrap (spec §6)
+      // refresh-on-open + first-connect bootstrap (spec §6); capture the
+      // report so a degraded-provider warning is visible immediately.
+      session.lastReport = (await client.reconcile([])) as ReconcileReport;
       session.manifest = (await client.load_manifest()) as Manifest;
       session.client = client;
       session.profileName = profile.name;
@@ -90,11 +91,6 @@ export const session: Session = $state({
     } finally {
       session.connecting = false;
     }
-  },
-
-  async refreshManifest() {
-    if (!session.client) return;
-    session.manifest = (await session.client.load_manifest()) as Manifest;
   },
 
   /** Manual refresh (spec §6): reconciles remote changes, then reloads the

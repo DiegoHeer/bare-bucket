@@ -54,6 +54,25 @@ describe("childEntries", () => {
     const { files } = childEntries(withDeleted, "");
     expect(files.map((f) => f.key)).not.toContain("gone.txt");
   });
+
+  it("never yields empty-named folders for keys with '//' or a leading '/' (such objects become unreachable dead ends rather than blank clickable rows)", () => {
+    const weird = [obj("weird//double.txt"), obj("/leading.txt")];
+
+    // Root: "weird" is a real (non-empty) segment, so it becomes a folder.
+    // "/leading.txt" has an empty first segment and is skipped outright —
+    // it surfaces as neither a folder nor a file anywhere.
+    const root = childEntries(weird, "");
+    expect(root.folders.every((f) => f.name.length > 0)).toBe(true);
+    expect(root.folders.map((f) => f.name)).toEqual(["weird"]);
+    expect(root.files).toEqual([]);
+
+    // Descending into "weird/": the remaining "/double.txt" also has an
+    // empty first segment, so it's skipped too — the folder is a dead end
+    // with no children, rather than showing a blank-named row.
+    const inWeird = childEntries(weird, "weird/");
+    expect(inWeird.folders).toEqual([]);
+    expect(inWeird.files).toEqual([]);
+  });
 });
 
 describe("buildTree", () => {

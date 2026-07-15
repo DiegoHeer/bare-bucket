@@ -15,7 +15,7 @@
     );
     const folders = listing.folders.length;
     const files = listing.files.length;
-    return `${folders} folder${folders === 1 ? "" : "s"}, ${files} file${files === 1 ? "" : "s"} · ${formatSize(bytes)}`;
+    return `${folders} folder${folders === 1 ? "" : "s"}, ${files} file${files === 1 ? "" : "s"} · ${formatSize(bytes)} total`;
   });
 </script>
 
