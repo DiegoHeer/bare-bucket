@@ -1,15 +1,18 @@
 <script lang="ts">
-  // Fullscreen preview overlay (spec §7.5, plan [B3][B4][B5][B9]) on
-  // ModalBase's fullscreen variant. Task 1 lands the shell + routing switch:
-  // every kind renders the metadata+download fallback for now; Task 2 fills
-  // in the image/pdf/text renderers behind the same `kind` branches. All
+  // Fullscreen preview overlay (spec §7.5, plan [B1][B3][B4][B5][B6][B9]) on
+  // ModalBase's fullscreen variant: routes on `previewKind` to an <img>
+  // (image), a ranged/capped <pre> (text, via textPreview.ts), or the
+  // metadata+download fallback for anything else/unmatched (the pdf.js
+  // renderer lands in a follow-up commit, behind the same `kind === "pdf"`
+  // branch — for now it falls through to the metadata fallback too). All
   // overlay actions reuse BrowseScreen's existing handlers/session methods
   // verbatim [B4] — no parallel download/favorite/delete flows here.
   import ModalBase from "./ModalBase.svelte";
   import { session } from "../lib/session.svelte";
   import { displayName, formatModified, formatSize } from "../lib/listing";
   import { previewKind } from "../lib/preview";
-  import type { ManifestObject } from "../lib/core";
+  import { fetchTextPreview } from "../lib/textPreview";
+  import type { ManifestObject, PresignedRequest } from "../lib/core";
 
   interface Props {
     object: ManifestObject;
@@ -50,32 +53,93 @@
   const name = $derived(displayName(object.key).name);
   const kind = $derived(previewKind(object));
 
-  // Loading/error+Retry scaffolding [B9] that Task 2's per-kind renderers
-  // (image <img> load, ranged text fetch, pdf.js doc open) will drive by
-  // replacing this function's body. The metadata-only fallback Task 1
-  // renders needs no network call, so this resolves immediately — the
-  // state and Retry button are wired up now so Task 2 only has to add the
-  // fetch, not the scaffolding around it. Error text is a status/provider
-  // message only, never a presigned URL [B1].
+  // Local, mirrors BrowseScreen.svelte's/transfers.svelte.ts's own copies of
+  // this constant (each site defines it independently — see their
+  // comments); no shared export exists for it.
+  const PRESIGN_EXPIRES_SECS = 3600;
+
+  // Loading/error+Retry scaffolding [B9]. Error text is always a
+  // status/provider message only, never the presigned URL [B1] — the catch
+  // block below strips it out defensively even though today's failure modes
+  // (fetch status text, pdf.js parse errors) shouldn't normally echo it.
   let previewLoading = $state(false);
   let previewError = $state<string | null>(null);
 
+  // Per-kind preview state [B1]: held only in this component's local state
+  // and cleared on navigate/unmount by `clearPreviewState` below — never
+  // logged, never persisted.
+  let imageUrl = $state<string | null>(null);
+  let textContent = $state<string | null>(null);
+  let textTruncated = $state(false);
+  let textAbort: AbortController | null = null;
+
+  // Bumped on every `loadPreview()` call so a slow in-flight load that
+  // resolves AFTER the user has already navigated to a different sibling
+  // recognizes it's stale and backs out instead of clobbering the new
+  // sibling's state (and leaking its own fetch).
+  let previewToken = 0;
+
+  function clearPreviewState() {
+    imageUrl = null;
+    textContent = null;
+    textTruncated = false;
+    if (textAbort) {
+      textAbort.abort();
+      textAbort = null;
+    }
+  }
+
+  function preloadImage(url: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const probe = new Image();
+      probe.onload = () => resolve();
+      probe.onerror = () => reject(new Error("Image failed to load"));
+      probe.src = url;
+    });
+  }
+
   async function loadPreview() {
+    const token = ++previewToken;
+    clearPreviewState();
     previewLoading = true;
     previewError = null;
+    let presignedUrl: string | null = null;
     try {
-      // No-op for now: the metadata fallback needs no fetch. Task 2 branches
-      // on `kind` here to actually fetch/open the real preview.
+      if (kind !== "none") {
+        if (!session.client) throw new Error("not connected"); // matches transfers.svelte.ts's own presign-guard message
+        // No attachment name: an inline preview must not force a
+        // Content-Disposition: attachment response.
+        const presigned = session.client.presign_get(object.key, PRESIGN_EXPIRES_SECS, null) as PresignedRequest;
+        presignedUrl = presigned.url;
+
+        if (kind === "image") {
+          await preloadImage(presigned.url);
+          if (token !== previewToken) return;
+          imageUrl = presigned.url;
+        } else if (kind === "text") {
+          const controller = new AbortController();
+          textAbort = controller;
+          const result = await fetchTextPreview(presigned.url, object.size, controller.signal);
+          if (token !== previewToken) return;
+          textContent = result.text;
+          textTruncated = result.truncated;
+        }
+        // kind === "pdf" falls through to the metadata fallback for now —
+        // the pdf.js renderer lands in a follow-up commit.
+      }
     } catch (e) {
-      previewError = e instanceof Error ? e.message : String(e);
+      if (token !== previewToken) return; // stale error from a superseded load
+      const raw = e instanceof Error ? e.message : String(e);
+      previewError = presignedUrl ? raw.split(presignedUrl).join("[link removed]") : raw;
     } finally {
-      previewLoading = false;
+      if (token === previewToken) previewLoading = false;
     }
   }
 
   $effect(() => {
-    void object.key; // re-run the (currently trivial) load when siblings change
+    void object.key; // re-run the load when siblings change
     void loadPreview();
+    return () => clearPreviewState(); // covers close/unmount; loadPreview also self-clears for direct Retry calls
   });
 
   function handleArrowKeys(e: KeyboardEvent) {
@@ -132,15 +196,17 @@
         <p>{previewError}</p>
         <button onclick={loadPreview}>Retry</button>
       </div>
-    {:else if kind === "image"}
-      <!-- Task 2: <img> renderer -->
-      {@render metadataFallback()}
-    {:else if kind === "pdf"}
-      <!-- Task 2: pdf.js renderer -->
-      {@render metadataFallback()}
-    {:else if kind === "text"}
-      <!-- Task 2: ranged, capped <pre> text renderer -->
-      {@render metadataFallback()}
+    {:else if kind === "image" && imageUrl}
+      <!-- [B1]/[B6]: presigned GET URL straight into <img> — SVGs render this
+           way too (never inline-injected, so embedded scripts can't run). -->
+      <img class="image-preview" src={imageUrl} alt={name} />
+    {:else if kind === "text" && textContent !== null}
+      <div class="text-preview">
+        <pre>{textContent}</pre>
+        {#if textTruncated}
+          <p class="truncated-notice">Preview truncated — download for the full file.</p>
+        {/if}
+      </div>
     {:else}
       {@render metadataFallback()}
     {/if}
@@ -269,4 +335,35 @@
     padding: 8px 18px;
     font-weight: 700;
   }
+  .image-preview {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+  }
+  .text-preview {
+    width: 100%;
+    height: 100%;
+    align-self: stretch;
+    justify-self: stretch;
+    overflow: auto;
+    display: grid;
+    align-content: start;
+    gap: 10px;
+  }
+  .text-preview pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    text-align: left;
+    color: var(--text-bright);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  .truncated-notice {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
+
 </style>
