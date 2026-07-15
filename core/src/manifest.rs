@@ -12,6 +12,21 @@ pub const MANIFEST_KEY: &str = ".bare-bucket/manifest.json.gz";
 /// hidden from the browse UI (spec §3.4).
 pub const RESERVED_PREFIX: &str = ".bare-bucket/";
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// Prefix for cached thumbnail objects (spec §9).
+pub const THUMBS_PREFIX: &str = ".bare-bucket/thumbs/";
+
+/// Bucket key of the thumbnail for `key` — mirrors the object tree.
+pub fn thumbnail_key_for(key: &str) -> String {
+    format!("{THUMBS_PREFIX}{key}.webp")
+}
+
+/// Inverse of [`thumbnail_key_for`]; `None` for keys outside the thumbs tree.
+pub fn original_key_for_thumbnail(thumb_key: &str) -> Option<String> {
+    thumb_key
+        .strip_prefix(THUMBS_PREFIX)?
+        .strip_suffix(".webp")
+        .map(str::to_string)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManifestObject {
@@ -438,5 +453,18 @@ mod tests {
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[10..11], "T");
         assert!(ts.ends_with('Z'));
+    }
+
+    #[test]
+    fn thumbnail_key_mapping_roundtrips() {
+        let key = "photos/2026/trip/IMG_0142.jpg";
+        let thumb = thumbnail_key_for(key);
+        assert_eq!(
+            thumb,
+            ".bare-bucket/thumbs/photos/2026/trip/IMG_0142.jpg.webp"
+        );
+        assert_eq!(original_key_for_thumbnail(&thumb).as_deref(), Some(key));
+        assert!(original_key_for_thumbnail("not-a-thumb-key").is_none());
+        assert!(original_key_for_thumbnail(".bare-bucket/thumbs/no-suffix.png").is_none());
     }
 }
