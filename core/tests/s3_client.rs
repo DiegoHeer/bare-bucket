@@ -4,7 +4,7 @@
 
 use bare_bucket_core::s3::{S3Client, S3Config, S3Error};
 use bare_bucket_core::signer::Credentials;
-use wiremock::matchers::{body_bytes, header, header_exists, method, path};
+use wiremock::matchers::{body_bytes, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn client_for(server: &MockServer) -> S3Client {
@@ -192,4 +192,37 @@ async fn authorization_header_has_sigv4_shape() {
     assert!(auth.contains("x-amz-content-sha256"));
     assert!(auth.contains("x-amz-date"));
     assert!(auth.contains("Signature="));
+}
+
+#[tokio::test]
+async fn list_all_follows_continuation_tokens() {
+    let server = MockServer::start().await;
+    let page1 = r#"<?xml version="1.0"?><ListBucketResult>
+      <IsTruncated>true</IsTruncated>
+      <NextContinuationToken>tok2</NextContinuationToken>
+      <Contents><Key>a.txt</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>"e1"</ETag><Size>1</Size></Contents>
+    </ListBucketResult>"#;
+    let page2 = r#"<?xml version="1.0"?><ListBucketResult>
+      <IsTruncated>false</IsTruncated>
+      <Contents><Key>b.txt</Key><LastModified>2026-01-02T00:00:00Z</LastModified><ETag>"e2"</ETag><Size>2</Size></Contents>
+    </ListBucketResult>"#;
+
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("continuation-token", "tok2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(page2))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("list-type", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(page1))
+        .mount(&server)
+        .await;
+
+    let objects = client_for(&server).list_all(None).await.unwrap();
+    assert_eq!(objects.len(), 2);
+    assert_eq!(objects[0].key, "a.txt");
+    assert_eq!(objects[1].key, "b.txt");
 }

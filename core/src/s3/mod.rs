@@ -6,8 +6,10 @@
 //! (spec §3.3); PR 4 adds multipart *descriptors* for the UI to execute.
 
 pub mod error;
+mod list;
 
 pub use error::S3Error;
+pub use list::{ListPage, ObjectInfo};
 
 use crate::signer::{
     authorization_header, canonical_query_string, sha256_hex, sign, uri_encode, CanonicalRequest,
@@ -168,6 +170,51 @@ impl S3Client {
                 return Err(error);
             }
             sleep_ms(backoff_ms(attempt)).await;
+        }
+    }
+
+    /// One page of ListObjectsV2 results.
+    pub async fn list_page(
+        &self,
+        prefix: Option<&str>,
+        continuation_token: Option<&str>,
+        max_keys: Option<u32>,
+    ) -> Result<ListPage, S3Error> {
+        let max_keys_value;
+        let mut query: Vec<(&str, &str)> = vec![("list-type", "2")];
+        if let Some(p) = prefix {
+            query.push(("prefix", p));
+        }
+        if let Some(t) = continuation_token {
+            query.push(("continuation-token", t));
+        }
+        if let Some(m) = max_keys {
+            max_keys_value = m.to_string();
+            query.push(("max-keys", &max_keys_value));
+        }
+        let response = self
+            .send(reqwest::Method::GET, None, &query, &[], None)
+            .await?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| S3Error::Network(e.to_string()))?;
+        list::parse_list_response(&body)
+    }
+
+    /// Every object under `prefix`, following continuation tokens.
+    pub async fn list_all(&self, prefix: Option<&str>) -> Result<Vec<ObjectInfo>, S3Error> {
+        let mut all = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self.list_page(prefix, token.as_deref(), None).await?;
+            all.extend(page.objects);
+            if !page.is_truncated {
+                return Ok(all);
+            }
+            token = Some(page.next_continuation_token.ok_or_else(|| {
+                S3Error::InvalidResponse("truncated list without continuation token".into())
+            })?);
         }
     }
 
