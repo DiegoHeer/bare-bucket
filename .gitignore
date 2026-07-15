@@ -1,3 +1,5 @@
 .superpowers/
 /target
 core/pkg/
+web/node_modules/
+web/dist/
