@@ -88,6 +88,12 @@ describe("formatSize", () => {
     expect(formatSize(4404019)).toBe("4.2 MB");
     expect(formatSize(8.2 * 1024 ** 3)).toBe("8.2 GB");
   });
+
+  it("rolls over to the next unit at rounding boundaries", () => {
+    expect(formatSize(1024 ** 2 - 1)).toBe("1 MB");
+    expect(formatSize(1024 ** 3 - 1)).toBe("1 GB");
+    expect(formatSize(1023)).toBe("1023 B");
+  });
 });
 
 describe("formatModified", () => {
@@ -101,6 +107,10 @@ describe("formatModified", () => {
   });
   it("tolerates unparseable timestamps", () => {
     expect(formatModified("not-a-date", now)).toBe("—");
+  });
+  it("is timezone-independent for absolute dates", () => {
+    expect(formatModified("2026-01-05T00:00:00Z", now)).toBe("Jan 5, 2026");
+    expect(formatModified("2026-01-05T23:59:00Z", now)).toBe("Jan 5, 2026");
   });
 });
 

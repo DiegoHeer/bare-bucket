@@ -75,13 +75,25 @@ export function formatSize(bytes: number): string {
   const units = ["KB", "MB", "GB", "TB"];
   let value = bytes;
   let unit = "B";
-  for (const next of units) {
+  let unitIndex = -1;
+  for (let i = 0; i < units.length; i++) {
     if (value < 1024) break;
     value /= 1024;
-    unit = next;
+    unit = units[i];
+    unitIndex = i;
   }
-  const rounded = value >= 100 ? Math.round(value).toString() : (Math.round(value * 10) / 10).toString();
-  return `${rounded.endsWith(".0") ? rounded.slice(0, -2) : rounded} ${unit}`;
+  let rounded = value >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
+
+  // Rollover at boundaries: if rounded reaches 1024 and next unit exists
+  while (rounded === 1024 && unitIndex + 1 < units.length) {
+    rounded /= 1024;
+    unitIndex++;
+    unit = units[unitIndex];
+    rounded = rounded >= 100 ? Math.round(rounded) : Math.round(rounded * 10) / 10;
+  }
+
+  const roundedStr = rounded.toString();
+  return `${roundedStr.endsWith(".0") ? roundedStr.slice(0, -2) : roundedStr} ${unit}`;
 }
 
 export function formatModified(iso: string, now: Date = new Date()): string {
@@ -96,6 +108,7 @@ export function formatModified(iso: string, now: Date = new Date()): string {
     month: "short",
     day: "numeric",
     year: "numeric",
+    timeZone: "UTC",
   });
 }
 
