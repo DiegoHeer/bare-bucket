@@ -2,8 +2,11 @@
 //! repair out-of-band drift, purge tombstones, clean orphaned thumbnails
 //! and dangling multipart uploads.
 
-use crate::manifest::{Manifest, ManifestObject};
-use crate::s3::ObjectInfo;
+use crate::manifest::{
+    now_iso8601, original_key_for_thumbnail, Manifest, ManifestError, ManifestObject,
+    ManifestStore, RESERVED_PREFIX, THUMBS_PREFIX,
+};
+use crate::s3::{ObjectInfo, S3Client, S3Error};
 use std::collections::{HashMap, HashSet};
 
 /// Extension-based content-type guess for objects created outside the app
@@ -133,6 +136,163 @@ pub fn plan_rebuild(
         .count() as u32;
 
     (rows, counters)
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub added: u32,
+    pub updated: u32,
+    pub removed: u32,
+    pub thumbnails_deleted: u32,
+    pub uploads_aborted: u32,
+    /// `false` when the manifest write was unconditional (bootstrap or 501
+    /// last-writer-wins degradation).
+    pub conditional: bool,
+}
+
+pub struct ReconcileOptions<'a> {
+    /// Upload IDs this session knows are in flight — never aborted.
+    pub active_upload_ids: &'a [String],
+    /// Only abort uploads whose `Initiated` timestamp is at least this old.
+    /// Unparseable timestamps are never aborted.
+    pub min_upload_age_secs: u64,
+}
+
+impl Default for ReconcileOptions<'static> {
+    fn default() -> Self {
+        ReconcileOptions {
+            active_upload_ids: &[],
+            min_upload_age_secs: 3600,
+        }
+    }
+}
+
+/// Full-bucket reconciliation (spec §6). Self-heals drift caused by tools
+/// that bypass the app (rclone, provider consoles), purges tombstones,
+/// removes orphaned thumbnails, and aborts dangling multipart uploads.
+pub async fn reconcile(
+    client: &S3Client,
+    device_id: &str,
+    options: &ReconcileOptions<'_>,
+) -> Result<ReconcileReport, ManifestError> {
+    reconcile_inner(client, device_id, options, true).await
+}
+
+async fn reconcile_inner(
+    client: &S3Client,
+    device_id: &str,
+    options: &ReconcileOptions<'_>,
+    retry_on_recovery_conflict: bool,
+) -> Result<ReconcileReport, ManifestError> {
+    // 1. The bucket truth.
+    let all = client.list_all(None).await.map_err(ManifestError::from)?;
+    let mut data_objects = Vec::new();
+    let mut thumb_keys = std::collections::HashSet::new();
+    for info in all {
+        if info.key.starts_with(THUMBS_PREFIX) {
+            thumb_keys.insert(info.key.clone());
+        } else if info.key.starts_with(RESERVED_PREFIX) {
+            // manifest + other app-internal objects: never manifest rows
+        } else {
+            data_objects.push(info);
+        }
+    }
+
+    // 2. Current manifest (corrupt → rebuild from scratch, remember etag).
+    let store = ManifestStore::new(client, device_id);
+    let mut corrupt_etag: Option<String> = None;
+    let (current, current_etag) = match store.load().await {
+        Ok(loaded) => (loaded.manifest, loaded.etag),
+        Err(ManifestError::Corrupt { etag, .. }) => {
+            corrupt_etag = etag.clone();
+            (Manifest::empty(), etag)
+        }
+        Err(e) => return Err(e),
+    };
+
+    // 3. Plan the rebuild.
+    let (rows, counters) = plan_rebuild(&current, &data_objects, &thumb_keys);
+
+    // 4. Orphaned thumbnails.
+    let data_keys: std::collections::HashSet<&str> =
+        data_objects.iter().map(|o| o.key.as_str()).collect();
+    let mut thumbnails_deleted = 0u32;
+    for thumb in &thumb_keys {
+        let orphaned = match original_key_for_thumbnail(thumb) {
+            Some(original) => !data_keys.contains(original.as_str()),
+            None => true, // unparseable name inside the thumbs tree
+        };
+        if orphaned {
+            match client.delete_object(thumb).await {
+                Ok(()) | Err(S3Error::NotFound { .. }) => thumbnails_deleted += 1,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    // 5. Dangling multipart uploads.
+    let mut uploads_aborted = 0u32;
+    let now = time::OffsetDateTime::now_utc();
+    for upload in client
+        .list_multipart_uploads()
+        .await
+        .map_err(ManifestError::from)?
+    {
+        if options.active_upload_ids.contains(&upload.upload_id) {
+            continue;
+        }
+        let old_enough = time::OffsetDateTime::parse(
+            &upload.initiated,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map(|initiated| (now - initiated).whole_seconds() >= options.min_upload_age_secs as i64)
+        .unwrap_or(false); // never abort what we cannot age
+        if !old_enough {
+            continue;
+        }
+        match client
+            .abort_multipart_upload(&upload.key, &upload.upload_id)
+            .await
+        {
+            Ok(()) | Err(S3Error::NotFound { .. }) => uploads_aborted += 1,
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    // 6. Write the manifest. Timestamp computed OUTSIDE the mutator closure
+    // (update_with_retry may run it multiple times).
+    let rebuild_time = now_iso8601();
+    let outcome = if corrupt_etag.is_some() {
+        // Recovery: replace exactly the corrupt bytes we observed.
+        let mut fresh = Manifest::empty();
+        fresh.objects = rows.clone();
+        fresh.last_full_rebuild_at = Some(rebuild_time.clone());
+        match store.save(&mut fresh, current_etag.as_deref()).await {
+            Ok(outcome) => outcome,
+            Err(ManifestError::S3(S3Error::PreconditionFailed)) if retry_on_recovery_conflict => {
+                // Someone rewrote the manifest mid-recovery; it is probably
+                // valid now — rerun the whole reconcile once.
+                return Box::pin(reconcile_inner(client, device_id, options, false)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        store
+            .update_with_retry(|m| {
+                m.objects = rows.clone();
+                m.last_full_rebuild_at = Some(rebuild_time.clone());
+            })
+            .await?
+    };
+
+    Ok(ReconcileReport {
+        added: counters.added,
+        updated: counters.updated,
+        removed: counters.removed,
+        thumbnails_deleted,
+        uploads_aborted,
+        conditional: outcome.conditional,
+    })
 }
 
 #[cfg(test)]
