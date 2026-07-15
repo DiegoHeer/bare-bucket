@@ -49,4 +49,26 @@ if (manifest.objects.length > 0) {
   );
 }
 
+// Favorite roundtrip (exercises the writer-lock mutation path end-to-end).
+if (manifest.objects.length > 0) {
+  const key = manifest.objects[0].key;
+  await client.set_favorite(key, true);
+  const after = await client.load_manifest();
+  const starred = after.objects.find((o) => o.key === key);
+  if (starred?.favorite !== true) throw new Error("favorite did not persist");
+  await client.set_favorite(key, false);
+  const reverted = await client.load_manifest();
+  if (reverted.objects.find((o) => o.key === key)?.favorite !== false) {
+    throw new Error("unfavorite did not persist");
+  }
+  let threw = false;
+  try {
+    await client.set_favorite("definitely/not/a/key.bin", true);
+  } catch {
+    threw = true;
+  }
+  if (!threw) throw new Error("unknown key must throw");
+  console.log("favorite roundtrip: ok");
+}
+
 console.log("SMOKE OK");
