@@ -43,6 +43,14 @@ fn js_error(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }
 
+/// json_compatible: Option::None → null (not undefined), matching the
+/// declared TS types and spec §4.1.
+fn to_js<T: serde::Serialize>(value: &T) -> Result<JsValue, JsError> {
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(js_error)
+}
+
 #[wasm_bindgen]
 impl WasmClient {
     /// `config`: `{ endpoint, region, bucket, pathStyle, accessKeyId,
@@ -95,14 +103,14 @@ impl WasmClient {
         )
         .await
         .map_err(js_error)?;
-        serde_wasm_bindgen::to_value(&SerializableReport::from(&report)).map_err(js_error)
+        to_js(&SerializableReport::from(&report))
     }
 
     /// Load and decode the manifest (read-only — no lock needed).
     pub async fn load_manifest(&self) -> Result<JsValue, JsError> {
         let store = ManifestStore::new(&self.inner.client, &self.inner.device_id);
         let loaded = store.load().await.map_err(js_error)?;
-        serde_wasm_bindgen::to_value(&loaded.manifest).map_err(js_error)
+        to_js(&loaded.manifest)
     }
 }
 

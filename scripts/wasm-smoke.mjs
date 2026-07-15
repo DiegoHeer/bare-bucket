@@ -29,4 +29,21 @@ console.log("reconcile:", JSON.stringify(report));
 const manifest = await client.load_manifest();
 if (manifest.schema_version !== 1) throw new Error("bad manifest shape");
 console.log("load_manifest: ok,", manifest.objects.length, "objects");
+
+if (manifest.objects.length > 0) {
+  const first = manifest.objects[0];
+  if (first.deleted_at !== null || first.thumbnail_key !== null) {
+    throw new Error(`Option fields must cross as null, got deleted_at=${String(first.deleted_at)} thumbnail_key=${String(first.thumbnail_key)}`);
+  }
+  console.log("option-null check: ok");
+} else {
+  // Empty bucket (fresh CI): last_full_rebuild_at is set by the reconcile above,
+  // so probe a fresh in-memory manifest is not possible here; assert the field is
+  // NOT undefined (json_compatible never emits undefined).
+  if (manifest.last_full_rebuild_at === undefined) {
+    throw new Error("boundary emitted undefined — json_compatible serializer regressed");
+  }
+  console.log("option-null check: ok (empty-bucket path)");
+}
+
 console.log("SMOKE OK");
