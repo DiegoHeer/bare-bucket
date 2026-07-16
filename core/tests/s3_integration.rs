@@ -219,3 +219,72 @@ async fn multipart_roundtrip_via_presigned_descriptors() {
 
     client.delete_object(&key).await.expect("cleanup");
 }
+
+#[tokio::test]
+async fn manifest_conflict_loop_preserves_concurrent_changes() {
+    use bare_bucket_core::manifest::{ManifestObject, ManifestStore, MANIFEST_KEY};
+
+    let Some(client) = client() else { return };
+    // Isolate: remove any manifest left by a previous run.
+    let _ = client.delete_object(MANIFEST_KEY).await;
+
+    let object = |key: &str| ManifestObject {
+        key: key.to_string(),
+        size: 1,
+        etag: "\"e\"".to_string(),
+        last_modified: "2026-07-15T00:00:00Z".to_string(),
+        content_type: "text/plain".to_string(),
+        favorite: false,
+        thumbnail_key: None,
+        deleted_at: None,
+    };
+
+    let store_a = ManifestStore::new(&client, "device-a");
+    let store_b = ManifestStore::new(&client, "device-b");
+
+    // Bootstrap via A.
+    let first = store_a
+        .update_with_retry(|m| m.upsert(object("from-a-1.txt")))
+        .await
+        .expect("bootstrap write");
+    assert_eq!(first.attempts, 1);
+
+    // Simulate a stale writer: B loads now…
+    let stale = store_b.load().await.expect("stale load");
+    let stale_etag = stale.etag.clone().expect("etag after bootstrap");
+
+    // …A writes again (bumping the ETag)…
+    store_a
+        .update_with_retry(|m| m.upsert(object("from-a-2.txt")))
+        .await
+        .expect("second write");
+
+    // …then B's direct conditional save against the stale ETag must 412.
+    let mut stale_manifest = stale.manifest;
+    stale_manifest.upsert(object("from-b.txt"));
+    let err = store_b
+        .save(&mut stale_manifest, Some(&stale_etag))
+        .await
+        .expect_err("stale conditional save must fail");
+    assert!(matches!(
+        err,
+        bare_bucket_core::manifest::ManifestError::S3(
+            bare_bucket_core::s3::S3Error::PreconditionFailed
+        )
+    ));
+
+    // But B's update_with_retry resolves the conflict and preserves A's data.
+    let outcome = store_b
+        .update_with_retry(|m| m.upsert(object("from-b.txt")))
+        .await
+        .expect("retry loop");
+    assert!(outcome.conditional, "MinIO supports conditional writes");
+
+    let merged = store_b.load().await.expect("final load");
+    for key in ["from-a-1.txt", "from-a-2.txt", "from-b.txt"] {
+        assert!(merged.manifest.get(key).is_some(), "missing {key}");
+    }
+    assert_eq!(merged.manifest.last_writer_device_id, "device-b");
+
+    client.delete_object(MANIFEST_KEY).await.expect("cleanup");
+}
