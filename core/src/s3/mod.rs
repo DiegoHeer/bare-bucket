@@ -247,10 +247,20 @@ impl S3Client {
     }
 
     /// Cheap connectivity/credential check: HEAD on the bucket root.
+    ///
+    /// A 404 here means the *bucket* doesn't exist, not a missing object, so
+    /// it's remapped to a provider error with a message that says as much —
+    /// `S3Error::NotFound` reads as "object not found" everywhere else.
     pub async fn head_bucket(&self) -> Result<(), S3Error> {
-        self.send(reqwest::Method::HEAD, None, &[], &[], None)
-            .await
-            .map(|_| ())
+        match self.send(reqwest::Method::HEAD, None, &[], &[], None).await {
+            Ok(_) => Ok(()),
+            Err(S3Error::NotFound { .. }) => Err(S3Error::Provider {
+                status: 404,
+                message: "bucket not found — check the bucket name and endpoint".into(),
+                retryable: false,
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn get_object(&self, key: &str) -> Result<GetResult, S3Error> {
@@ -339,7 +349,13 @@ fn classify(status: u16, key: Option<&str>, body: String) -> S3Error {
             key: key.unwrap_or_default().to_string(),
         },
         412 => S3Error::PreconditionFailed,
-        403 => S3Error::AccessDenied { message },
+        403 => S3Error::AccessDenied {
+            message: if message.is_empty() {
+                "check the access key and secret".to_string()
+            } else {
+                message
+            },
+        },
         408 | 429 | 500 | 502 | 503 | 504 => S3Error::Provider {
             status,
             message,

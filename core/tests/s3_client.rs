@@ -165,6 +165,34 @@ async fn head_bucket_hits_bucket_root() {
 }
 
 #[tokio::test]
+async fn get_object_403_with_empty_body_gets_actionable_message() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let err = client_for(&server)
+        .get_object("secret.txt")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("access key"));
+}
+
+#[tokio::test]
+async fn head_bucket_404_reports_bucket_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/test-bucket"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let err = client_for(&server).head_bucket().await.unwrap_err();
+    assert!(err.to_string().contains("bucket not found"));
+}
+
+#[tokio::test]
 async fn authorization_header_has_sigv4_shape() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
