@@ -7,11 +7,13 @@
   import TransferPanel from "../components/TransferPanel.svelte";
   import ConflictModal from "../components/ConflictModal.svelte";
   import DeleteConfirmModal from "../components/DeleteConfirmModal.svelte";
+  import Lightbox from "../components/Lightbox.svelte";
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
   import { transfers, keysInStatus } from "../lib/transfers.svelte";
   import { anchorDownload, pickSaveTarget, supportsFsa } from "../lib/download";
   import { folderLabel, hasConflict, takenNamesInPrefix } from "../lib/conflicts";
+  import { advanceOrClose, nextSiblingKey, siblingKeys } from "../lib/preview";
   import {
     childEntries,
     displayName,
@@ -47,6 +49,12 @@
   let conflictQueue = $state<QueuedConflict[]>([]);
   const currentConflict = $derived(conflictQueue[0] ?? null);
   let pendingDelete = $state<PendingDelete | null>(null);
+
+  // Lightbox state [B8]: which file's overlay is open, keyed by its manifest
+  // key (not the object itself) so it survives the underlying object being
+  // replaced by a manifest refresh/optimistic update — `lightboxObject`
+  // below always re-derives off the CURRENT session.manifest.
+  let lightboxKey = $state<string | null>(null);
 
   // Transfer keys still actually "in flight" — a cancelled or errored-out
   // transfer never lands, so its key doesn't occupy anything. Shared by
@@ -157,7 +165,8 @@
   }
 
   /** Opens the delete confirm modal for `file` (spec §7.6, [B9]) — wired to
-   * the FileList/FileGrid row action. */
+   * the FileList/FileGrid row action AND the lightbox's delete button
+   * [B4] (same modal, same flow, no lightbox-local copy). */
   function requestDelete(file: ManifestObject) {
     pendingDelete = { key: file.key, name: displayName(file.key).name };
   }
@@ -171,11 +180,37 @@
    * success path, which is what actually closes the modal. Deleting the
    * last file in a folder relies on the existing stale-prefix ancestor
    * fallback effect further down (PR 9) once the manifest reflects the
-   * tombstone. */
+   * tombstone.
+   *
+   * [B4] If the deleted file was the one open in the lightbox, the
+   * lightbox advances to its next sibling (or closes if there wasn't one) —
+   * `nextKey` MUST be captured off the PRE-delete `previewKeys` below,
+   * before `session.deleteObject` applies the tombstone and removes
+   * `pendingDelete.key` from that (tombstone-filtered) list. */
   async function confirmDelete() {
     if (!pendingDelete) return;
-    await session.deleteObject(pendingDelete.key);
+    const deletedKey = pendingDelete.key;
+    const nextKey = nextSiblingKey(previewKeys, deletedKey, 1);
+    await session.deleteObject(deletedKey);
     pendingDelete = null;
+    lightboxKey = advanceOrClose(deletedKey, lightboxKey, nextKey);
+  }
+
+  /** Opens the lightbox for `file` [B8] — wired to the FileList/FileGrid
+   * row's name button/tile. */
+  function openLightbox(file: ManifestObject) {
+    lightboxKey = file.key;
+  }
+  function closeLightbox() {
+    lightboxKey = null;
+  }
+  function lightboxPrev() {
+    const key = nextSiblingKey(previewKeys, lightboxKey ?? "", -1);
+    if (key) lightboxKey = key;
+  }
+  function lightboxNext() {
+    const key = nextSiblingKey(previewKeys, lightboxKey ?? "", 1);
+    if (key) lightboxKey = key;
   }
 
   const listing = $derived(childEntries(session.manifest?.objects ?? [], browse.prefix));
@@ -227,6 +262,23 @@
         return "";
     }
   });
+
+  // Lightbox sibling order [B3]: whichever file list is currently on
+  // screen — the folder listing, or the flat Recent/Favorites/Search list —
+  // in that same listing order, tombstone-free.
+  const previewKeys = $derived(siblingKeys(browse.section === "all" ? listing.files : sectionFiles));
+  const lightboxObject = $derived(
+    lightboxKey
+      ? (session.manifest?.objects.find((o) => o.key === lightboxKey && o.deleted_at === null) ?? null)
+      : null,
+  );
+  const lightboxIndex = $derived(lightboxKey ? previewKeys.indexOf(lightboxKey) : -1);
+  const canLightboxPrev = $derived(lightboxIndex > 0);
+  const canLightboxNext = $derived(lightboxIndex !== -1 && lightboxIndex < previewKeys.length - 1);
+  // Delete confirm nested on top of the lightbox [B3][B4] — reuses the
+  // same `pendingDelete` state the row action sets, so both entry points
+  // share one modal instance.
+  const lightboxNestedModalOpen = $derived(pendingDelete !== null);
 
   // A section switch or a stale (e.g. just-deleted) prefix can leave
   // `browse.prefix` pointing at a folder with no children; walk up to the
@@ -293,9 +345,21 @@
       >
         {#if browse.section === "all"}
           {#if browse.view === "list"}
-            <FileList {listing} onDownload={downloadFile} onDelete={requestDelete} {deleteBlockedKeys} />
+            <FileList
+              {listing}
+              onOpen={openLightbox}
+              onDownload={downloadFile}
+              onDelete={requestDelete}
+              {deleteBlockedKeys}
+            />
           {:else}
-            <FileGrid {listing} onDownload={downloadFile} onDelete={requestDelete} {deleteBlockedKeys} />
+            <FileGrid
+              {listing}
+              onOpen={openLightbox}
+              onDownload={downloadFile}
+              onDelete={requestDelete}
+              {deleteBlockedKeys}
+            />
           {/if}
           {#if listing.folders.length === 0 && listing.files.length === 0}
             <p class="empty">This folder is empty.</p>
@@ -305,6 +369,7 @@
           <FileList
             files={sectionFiles}
             showPath
+            onOpen={openLightbox}
             onDownload={downloadFile}
             onDelete={requestDelete}
             {deleteBlockedKeys}
@@ -325,6 +390,21 @@
 </div>
 
 <TransferPanel />
+
+{#if lightboxObject}
+  <Lightbox
+    object={lightboxObject}
+    canPrev={canLightboxPrev}
+    canNext={canLightboxNext}
+    onPrev={lightboxPrev}
+    onNext={lightboxNext}
+    onClose={closeLightbox}
+    onDownload={downloadFile}
+    onDeleteRequest={requestDelete}
+    deleteBlocked={deleteBlockedKeys.has(lightboxObject.key)}
+    nestedModalOpen={lightboxNestedModalOpen}
+  />
+{/if}
 
 {#if currentConflict}
   {#key currentConflict.id}

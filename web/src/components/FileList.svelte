@@ -10,6 +10,9 @@
   // or a flat files-only mode (Recent/Favorites/Search) that shows each
   // file's parent path instead of relying on the current prefix.
   type Props = ({ listing: Listing; showPath?: false } | { files: ManifestObject[]; showPath: true }) & {
+    /** Opens the lightbox for this file [B8] — wired to a real button
+     * around the name so Enter/Space activates it like the folder row. */
+    onOpen: (file: ManifestObject) => void;
     onDownload: (file: ManifestObject) => void;
     onDelete: (file: ManifestObject) => void;
     /** Keys with an in-flight transfer (queued/uploading/paused/downloading)
@@ -50,7 +53,9 @@
     {#each files as file (file.key)}
       <tr>
         <td class="name">
-          {iconFor(file.content_type)} {fileName(file.key)}
+          <button class="row-button" onclick={() => props.onOpen(file)}
+            >{iconFor(file.content_type)} {fileName(file.key)}</button
+          >
           {#if showPath && parentPath(file.key)}
             <button
               class="path"

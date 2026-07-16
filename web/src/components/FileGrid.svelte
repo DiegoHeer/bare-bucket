@@ -7,11 +7,14 @@
 
   let {
     listing,
+    onOpen,
     onDownload,
     onDelete,
     deleteBlockedKeys,
   }: {
     listing: Listing;
+    /** Opens the lightbox for this file [B8]. */
+    onOpen: (file: ManifestObject) => void;
     onDownload: (file: ManifestObject) => void;
     onDelete: (file: ManifestObject) => void;
     /** Keys with an in-flight transfer (queued/uploading/paused/downloading)
@@ -62,8 +65,14 @@
           onDelete(file);
         }}
       >🗑</button>
-      <span class="thumb">{iconFor(file.content_type)}</span>
-      <span class="caption">{fileName(file.key)}</span>
+      <!-- A real button (not the whole `.tile`, which would nest it inside
+           the action buttons above — invalid HTML) so Enter/Space opens the
+           lightbox [B8]; the action buttons are absolutely-positioned
+           siblings layered on top and keep working independently. -->
+      <button class="open" onclick={() => onOpen(file)}>
+        <span class="thumb">{iconFor(file.content_type)}</span>
+        <span class="caption">{fileName(file.key)}</span>
+      </button>
     </div>
   {/each}
 </div>
@@ -85,6 +94,29 @@
     text-align: center;
     color: inherit;
     font: inherit;
+  }
+  /* The file tile's `.tile` is a plain `<div>` whose only in-flow child is
+     `.open` (the action buttons are position:absolute, out of flow) — the
+     grid/gap/text-align above places that one child; `.open` needs its own
+     copy of the same rules to lay out ITS OWN thumb+caption children. The
+     folder tile (a bare `<button class="tile">`) has no `.open` at all and
+     relies solely on the rules above for its thumb+caption. */
+  .open {
+    display: grid;
+    gap: 8px;
+    width: 100%;
+    text-align: center;
+    color: inherit;
+    font: inherit;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+  }
+  .tile:has(.open:hover),
+  .tile:has(.open:focus-visible) {
+    border-color: var(--border-strong);
+    background: var(--surface-raised);
   }
   .star,
   .download,
