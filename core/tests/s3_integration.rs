@@ -130,3 +130,92 @@ async fn list_paginates_across_pages() {
         client.delete_object(key).await.expect("cleanup");
     }
 }
+
+#[tokio::test]
+async fn multipart_roundtrip_via_presigned_descriptors() {
+    let Some(client) = client() else { return };
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let key = format!("it/{run}/multipart/big.bin");
+
+    // Two 5 MiB parts (provider minimum for non-final parts) + verify the
+    // presigned descriptors work end-to-end the way the browser will use them.
+    let part_size = 5 * 1024 * 1024;
+    let part1 = vec![0xAAu8; part_size];
+    let part2 = vec![0xBBu8; part_size / 2]; // final part may be smaller
+
+    let upload_id = client
+        .create_multipart_upload(&key, "application/octet-stream")
+        .await
+        .expect("create");
+
+    // A dangling upload must be visible to the cleanup listing.
+    let dangling = client.list_multipart_uploads().await.expect("list uploads");
+    assert!(
+        dangling
+            .iter()
+            .any(|u| u.key == key && u.upload_id == upload_id),
+        "in-progress upload should be listed"
+    );
+
+    let http = reqwest::Client::new();
+    let mut parts: Vec<(u32, String)> = Vec::new();
+    for (number, bytes) in [(1u32, &part1), (2u32, &part2)] {
+        let descriptor = client.presign_upload_part(&key, &upload_id, number, 3600);
+        assert_eq!(descriptor.method, "PUT");
+        let response = http
+            .put(&descriptor.url)
+            .body(bytes.clone())
+            .send()
+            .await
+            .expect("part upload");
+        assert!(
+            response.status().is_success(),
+            "part {number} failed: {} {:?}",
+            response.status(),
+            response.text().await
+        );
+        let etag = response
+            .headers()
+            .get("etag")
+            .expect("part etag")
+            .to_str()
+            .unwrap()
+            .to_string();
+        parts.push((number, etag));
+    }
+
+    let final_etag = client
+        .complete_multipart_upload(&key, &upload_id, &parts)
+        .await
+        .expect("complete");
+    assert!(!final_etag.is_empty());
+
+    // Full object roundtrip
+    let got = client.get_object(&key).await.expect("get");
+    assert_eq!(got.bytes.len(), part_size + part_size / 2);
+    assert_eq!(&got.bytes[..part_size], &part1[..]);
+    assert_eq!(&got.bytes[part_size..], &part2[..]);
+
+    // Cleanup + abort path: start another upload and abort it
+    let abort_id = client
+        .create_multipart_upload(&key, "application/octet-stream")
+        .await
+        .expect("create for abort");
+    client
+        .abort_multipart_upload(&key, &abort_id)
+        .await
+        .expect("abort");
+    let after = client
+        .list_multipart_uploads()
+        .await
+        .expect("list after abort");
+    assert!(
+        !after.iter().any(|u| u.upload_id == abort_id),
+        "aborted upload must not be listed"
+    );
+
+    client.delete_object(&key).await.expect("cleanup");
+}

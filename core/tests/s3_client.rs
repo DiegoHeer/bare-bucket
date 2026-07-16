@@ -226,3 +226,123 @@ async fn list_all_follows_continuation_tokens() {
     assert_eq!(objects[0].key, "a.txt");
     assert_eq!(objects[1].key, "b.txt");
 }
+
+#[tokio::test]
+async fn create_multipart_upload_posts_and_parses_upload_id() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/test-bucket/big.bin"))
+        .and(query_param("uploads", ""))
+        .and(header("content-type", "video/mp4"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<InitiateMultipartUploadResult><UploadId>uid-1</UploadId></InitiateMultipartUploadResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let upload_id = client_for(&server)
+        .create_multipart_upload("big.bin", "video/mp4")
+        .await
+        .unwrap();
+    assert_eq!(upload_id, "uid-1");
+}
+
+#[tokio::test]
+async fn complete_multipart_upload_sends_xml_and_parses_etag() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/test-bucket/big.bin"))
+        .and(query_param("uploadId", "uid-1"))
+        .and(body_bytes(
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;e1&quot;</ETag></Part></CompleteMultipartUpload>".to_vec(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<CompleteMultipartUploadResult><ETag>"combined"</ETag></CompleteMultipartUploadResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let etag = client_for(&server)
+        .complete_multipart_upload("big.bin", "uid-1", &[(1, "\"e1\"".to_string())])
+        .await
+        .unwrap();
+    assert_eq!(etag, "\"combined\"");
+}
+
+#[tokio::test]
+async fn complete_multipart_upload_detects_200_error_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                r#"<Error><Code>InternalError</Code><Message>boom</Message></Error>"#,
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client_for(&server)
+        .complete_multipart_upload("big.bin", "uid-1", &[(1, "\"e1\"".to_string())])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("InternalError"));
+}
+
+#[tokio::test]
+async fn complete_multipart_upload_rejects_empty_parts_without_a_network_call() {
+    let server = MockServer::start().await;
+    // Deliberately no Mock mounted: if the guard didn't fire before the
+    // network call, wiremock would fail with "no matching mock found".
+    let err = client_for(&server)
+        .complete_multipart_upload("big.bin", "uid-1", &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, S3Error::InvalidResponse(_)));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn abort_multipart_upload_deletes_with_upload_id() {
+    use wiremock::matchers::query_param;
+
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/test-bucket/big.bin"))
+        .and(query_param("uploadId", "uid-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    client_for(&server)
+        .abort_multipart_upload("big.bin", "uid-1")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn list_multipart_uploads_hits_bucket_root_with_uploads_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-bucket"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListMultipartUploadsResult>
+  <IsTruncated>false</IsTruncated>
+  <Upload>
+    <Key>big.bin</Key><UploadId>uid-1</UploadId>
+    <Initiated>2026-07-15T10:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let uploads = client_for(&server).list_multipart_uploads().await.unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].key, "big.bin");
+    assert_eq!(uploads[0].upload_id, "uid-1");
+}
