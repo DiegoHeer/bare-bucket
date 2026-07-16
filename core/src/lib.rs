@@ -1,5 +1,6 @@
 use wasm_bindgen::prelude::*;
 
+pub mod s3;
 pub mod signer;
 
 /// Returns the core crate version.
