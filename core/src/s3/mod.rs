@@ -399,6 +399,18 @@ fn normalize_authority(authority: &str, scheme: &str) -> String {
 
 fn classify(status: u16, key: Option<&str>, body: String) -> S3Error {
     let message: String = body.chars().take(500).collect();
+    // Polish item 12: an empty response body (some providers/proxies send no
+    // XML error body at all, e.g. behind a bare reverse proxy) must not
+    // produce a "provider error 500: " string with a trailing colon and
+    // nothing after it — fall back to a status-only description, same
+    // pattern the 403 branch below already uses for its own empty-body case.
+    let message_or_fallback = |message: String| {
+        if message.is_empty() {
+            format!("HTTP {status}, no body")
+        } else {
+            message
+        }
+    };
     match status {
         404 => S3Error::NotFound {
             key: key.unwrap_or_default().to_string(),
@@ -413,16 +425,18 @@ fn classify(status: u16, key: Option<&str>, body: String) -> S3Error {
         },
         408 | 429 | 500 | 502 | 503 | 504 => S3Error::Provider {
             status,
-            message,
+            message: message_or_fallback(message),
             retryable: true,
         },
         // Not Implemented: the provider doesn't support this operation (e.g.
         // conditional writes). The manifest layer (PR 5) detects this to
         // choose its fallback deliberately, rather than retrying forever.
-        501 => S3Error::Unsupported { message },
+        501 => S3Error::Unsupported {
+            message: message_or_fallback(message),
+        },
         _ => S3Error::Provider {
             status,
-            message,
+            message: message_or_fallback(message),
             retryable: false,
         },
     }
@@ -579,5 +593,28 @@ mod tests {
     fn classify_502_is_retryable_505_is_not() {
         assert!(classify(502, None, String::new()).is_retryable());
         assert!(!classify(505, None, String::new()).is_retryable());
+    }
+
+    #[test]
+    fn classify_with_an_empty_body_never_ends_the_message_in_a_bare_trailing_colon() {
+        // Polish item 12: a provider/proxy that sends no XML error body at
+        // all must not produce "provider error 500: " (colon, then nothing).
+        let provider_err = classify(500, None, String::new()).to_string();
+        assert!(
+            !provider_err.trim_end().ends_with(':'),
+            "got: {provider_err:?}"
+        );
+        assert!(provider_err.contains("500"));
+
+        let unsupported_err = classify(501, None, String::new()).to_string();
+        assert!(
+            !unsupported_err.trim_end().ends_with(':'),
+            "got: {unsupported_err:?}"
+        );
+
+        // A real body is passed through unchanged, not replaced by the
+        // fallback.
+        let real_body = classify(500, None, "Internal Server Error".to_string()).to_string();
+        assert!(real_body.contains("Internal Server Error"));
     }
 }
