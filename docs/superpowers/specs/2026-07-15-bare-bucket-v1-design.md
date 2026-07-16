@@ -124,6 +124,12 @@ v1 assumes a single active device. It ships only:
 - Fallback (Firefox/Safari): a small service worker converts the fetch into a browser-native download (StreamSaver-style pattern, implemented in-repo, no dependency).
 - Previews use ranged `GET`s (§7.5).
 
+> **v1 note (revised during implementation):** the service-worker fallback described above was replaced with a universal `<a download>` fallback before it was built (PR 11). Both a service worker and `showSaveFilePicker` require a **secure context** (HTTPS or `localhost`), and v1's primary deployment is LAN/VPN access over plain `http://<private-ip>` — an origin with neither. A StreamSaver-style service worker would therefore fail on exactly the origins that also lack `showSaveFilePicker`, while adding real service-worker lifetime/keepalive complexity for no coverage gain. The two tiers actually shipped:
+> 1. **File System Access API** (`showSaveFilePicker` → `WritableStream`) where available: a streamed fetch with a live, cancellable progress row in the transfer panel.
+> 2. **Universal fallback** (Firefox/Safari, or any plain-`http://` LAN origin): navigate a temporary `<a href download>` at a presigned `GET` URL carrying `response-content-disposition=attachment; filename="…"`. The browser's own download manager streams it natively — no CORS needed (it's a navigation, not a `fetch`), no in-page buffering, and it works on every origin. There's no panel row for this path; the browser shows its own download progress instead.
+>
+> Downloads are **cancel-only** in v1 — no pause/resume (that would need Range-based resume bookkeeping the engine doesn't have yet). Ranged `GET`s and the `Accept-Ranges`/`Range` CORS exposure they need (previews, §7.5) land with PR 13; full-object `GET`s are all either path uses until then.
+
 ## 6. Reconciliation
 
 Full-bucket LIST rebuild of the manifest — triggered manually (Refresh button), on app open, and on first-connect bootstrap. No background polling in v1.

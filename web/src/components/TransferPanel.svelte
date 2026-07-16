@@ -10,19 +10,34 @@
   // header shows an aggregate or falls back to a plain "Transfers" label.
   const activeItems = $derived(
     transfers.items.filter(
-      (t) => t.status === "queued" || t.status === "uploading" || t.status === "paused",
+      (t) =>
+        t.status === "queued" ||
+        t.status === "uploading" ||
+        t.status === "downloading" ||
+        t.status === "paused",
     ),
   );
 
-  // Cancelled/error rows never finish, so counting their size/uploaded bytes
-  // would permanently drag the aggregate below 100% even once every other
-  // row is done.
+  // The header's verb: "Uploading"/"Downloading" when every active row
+  // shares one direction, "Transferring" once both are mixed in — so the
+  // aggregate (which already counts/sums both directions) never mislabels a
+  // download-only or mixed batch as an upload.
+  const activeVerb = $derived.by(() => {
+    const hasUpload = activeItems.some((t) => t.direction === "upload");
+    const hasDownload = activeItems.some((t) => t.direction === "download");
+    if (hasUpload && hasDownload) return "Transferring";
+    return hasDownload ? "Downloading" : "Uploading";
+  });
+
+  // Cancelled/error rows never finish, so counting their size/transferred
+  // bytes would permanently drag the aggregate below 100% even once every
+  // other row is done.
   const aggregatePercent = $derived.by(() => {
     const counted = transfers.items.filter((t) => t.status !== "cancelled" && t.status !== "error");
     const totalSize = counted.reduce((sum, t) => sum + t.size, 0);
     if (totalSize === 0) return 100;
-    const totalUploaded = counted.reduce((sum, t) => sum + t.uploaded, 0);
-    return Math.min(100, Math.round((totalUploaded / totalSize) * 100));
+    const totalTransferred = counted.reduce((sum, t) => sum + t.transferred, 0);
+    return Math.min(100, Math.round((totalTransferred / totalSize) * 100));
   });
 
   // Small extension-based icon (Transfer rows don't carry a content-type —
@@ -40,30 +55,43 @@
 
   function percent(t: Transfer): number {
     if (t.size === 0) return 100;
-    return Math.min(100, Math.round((t.uploaded / t.size) * 100));
+    return Math.min(100, Math.round((t.transferred / t.size) * 100));
   }
 
-  // Pause/resume only ever applies to a multipart transfer still short of
-  // its full byte count — once the part loop finishes and Complete starts,
-  // the engine's `internal.completing` flag makes pause() a no-op, so hide
-  // the control once every byte is uploaded (mirrors that phase without
+  // Pause/resume only ever applies to a multipart upload still short of its
+  // full byte count — once the part loop finishes and Complete starts, the
+  // engine's `internal.completing` flag makes pause() a no-op, so hide the
+  // control once every byte is uploaded (mirrors that phase without
   // exposing internal engine state to the UI). Gated on raw bytes rather
   // than the rounded display percent so a 99.6%-rounds-to-100% row doesn't
-  // hide pause a beat before the part loop is actually done.
+  // hide pause a beat before the part loop is actually done. Downloads never
+  // show pause/resume [B5].
   function showPauseResume(t: Transfer): boolean {
-    return t.kind === "multipart" && (t.status === "uploading" || t.status === "paused") && t.uploaded < t.size;
+    return (
+      t.direction === "upload" &&
+      t.kind === "multipart" &&
+      (t.status === "uploading" || t.status === "paused") &&
+      t.transferred < t.size
+    );
   }
 
   // True during the Complete phase: every byte is uploaded but the row
   // hasn't settled to "done" yet (Complete's retry/backoff can take a few
   // seconds). Renders a "Finishing…" label instead of a progress bar —
   // there's no more per-byte progress to show, and pause is a no-op here.
+  // Download rows never "complete" this way — a download's "done" follows
+  // straight from its last chunk, so this only ever applies to uploads.
   function isCompleting(t: Transfer): boolean {
-    return t.status === "uploading" && t.uploaded >= t.size;
+    return t.direction === "upload" && t.status === "uploading" && t.transferred >= t.size;
   }
 
   function showCancel(t: Transfer): boolean {
-    return t.status === "queued" || t.status === "uploading" || t.status === "paused";
+    return (
+      t.status === "queued" ||
+      t.status === "uploading" ||
+      t.status === "downloading" ||
+      t.status === "paused"
+    );
   }
 </script>
 
@@ -74,7 +102,7 @@
         {#if activeItems.length === 0}
           Transfers
         {:else}
-          Uploading {transfers.items.length} item{transfers.items.length === 1 ? "" : "s"} · {aggregatePercent}%
+          {activeVerb} {transfers.items.length} item{transfers.items.length === 1 ? "" : "s"} · {aggregatePercent}%
         {/if}
       </span>
       <button
@@ -94,6 +122,11 @@
       <ul class="rows">
         {#each transfers.items as t (t.id)}
           <li>
+            <span
+              class="dir"
+              aria-hidden="true"
+              title={t.direction === "upload" ? "Upload" : "Download"}
+            >{t.direction === "upload" ? "↑" : "↓"}</span>
             <span class="icon">{iconFor(t.name)}</span>
             <span class="name" title={t.name}>{t.name}</span>
             <span class="status">
@@ -101,13 +134,21 @@
                 <span class="label">Queued</span>
               {:else if isCompleting(t)}
                 <span class="label">Finishing…</span>
-              {:else if t.status === "uploading" || t.status === "paused"}
+              {:else if t.status === "uploading" || t.status === "downloading" || t.status === "paused"}
                 <span class="bar"><span class="fill" style="width: {percent(t)}%"></span></span>
-                <span class="pct">{percent(t)}%{t.status === "paused" ? " · Paused" : ""}</span>
+                <span class="pct"
+                  >{percent(t)}%{t.status === "paused"
+                    ? " · Paused"
+                    : t.status === "downloading"
+                      ? " · Downloading"
+                      : ""}</span
+                >
               {:else if t.status === "done"}
                 <span class="label done">✓</span>
               {:else if t.status === "error"}
-                <span class="label error" title={t.error ?? ""}>{t.error ?? "Upload failed"}</span>
+                <span class="label error" title={t.error ?? ""}
+                  >{t.error ?? (t.direction === "download" ? "Download failed" : "Upload failed")}</span
+                >
               {:else if t.status === "cancelled"}
                 <span class="label">Cancelled</span>
               {/if}
@@ -189,6 +230,11 @@
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
+  }
+  .dir {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-dim);
   }
   .icon {
     flex-shrink: 0;

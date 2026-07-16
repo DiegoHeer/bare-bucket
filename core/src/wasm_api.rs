@@ -163,6 +163,26 @@ impl WasmClient {
         ))
     }
 
+    /// Presigned GET, optionally forcing a `Content-Disposition: attachment`
+    /// response so the browser's own download manager saves the file under
+    /// `attachment_name` (the universal fallback path, spec §5.2 amendment).
+    /// `expires_secs` is `u32` for the same reason as [`Self::presign_put`].
+    pub fn presign_get(
+        &self,
+        key: String,
+        expires_secs: u32,
+        attachment_name: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let disposition = attachment_name
+            .map(|name| format!("attachment; filename=\"{}\"", sanitize_filename(&name)));
+        to_js(&SerializablePresignedRequest::from(
+            &self
+                .inner
+                .client
+                .presign_get(&key, expires_secs.into(), disposition.as_deref()),
+        ))
+    }
+
     /// Start a multipart upload; returns the provider's upload ID.
     pub async fn create_multipart_upload(
         &self,
@@ -296,6 +316,17 @@ impl WasmClient {
     }
 }
 
+/// Strips characters that would let a display name break out of the
+/// `attachment; filename="…"` quoted-string it's embedded in ([B11]):
+/// double quotes and backslashes (quoted-string escaping) and CR/LF (header
+/// injection). The result still crosses the canonical-query encoder like any
+/// other `response-content-disposition` value.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n'))
+        .collect()
+}
+
 #[derive(serde::Deserialize)]
 struct JsPart {
     part_number: u32,
@@ -380,5 +411,32 @@ impl From<&crate::reconcile::ReconcileReport> for SerializableReport {
             uploads_aborted: r.uploads_aborted,
             conditional: r.conditional,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn sanitize_filename_passes_through_plain_names() {
+        assert_eq!(
+            sanitize_filename("vacation photo.jpg"),
+            "vacation photo.jpg"
+        );
+    }
+
+    #[test]
+    fn sanitize_filename_strips_quotes_and_backslash() {
+        assert_eq!(sanitize_filename(r#"evil".txt"#), "evil.txt");
+        assert_eq!(sanitize_filename(r"a\b\c.txt"), "abc.txt");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_crlf() {
+        assert_eq!(
+            sanitize_filename("name\r\nSet-Cookie: x=1.txt"),
+            "nameSet-Cookie: x=1.txt"
+        );
     }
 }

@@ -1,20 +1,23 @@
-// Upload transfer queue + engine (spec §5.1/§7.4). Owns the reactive
-// per-file rows the TransferPanel renders, the scheduler (<=3 files
-// uploading at once), and the multipart part loop (<=3 parts in flight).
+// Upload + download transfer queue + engine (spec §5.1/§7.4/§5.2). Owns the
+// reactive per-file rows the TransferPanel renders, the scheduler (<=3
+// files transferring at once, shared across both directions [B6]), the
+// multipart part loop (<=3 parts in flight, upload-only), and the download
+// reader loop that streams straight into a caller-acquired writable sink.
 //
-// Heavy/non-serializable bookkeeping (the `File`, in-flight
-// `AbortController`s, per-part progress) is kept OUT of the reactive
-// `$state` items — it lives in the `internals` side map, keyed by transfer
-// id, so the proxied `Transfer` rows stay plain, cheap-to-diff data.
+// Heavy/non-serializable bookkeeping (the `File`, the download `writable`,
+// in-flight `AbortController`s, per-part progress) is kept OUT of the
+// reactive `$state` items — it lives in the `internals` side map, keyed by
+// transfer id, so the proxied `Transfer` rows stay plain, cheap-to-diff
+// data.
 import { partRanges, putWithProgress, type PartRange, type PutProgress } from "./upload";
 import { session } from "./session.svelte";
 import type { PresignedRequest, UploadPlan, WasmClient } from "./core";
 
-/** Indirection seam for the engine's two live-only dependencies — the XHR
- * PUT driver and "the currently connected client" — so tests can swap in a
- * mock client/upload driver without needing a real wasm client or network
- * access. Production code never overrides this; it's read fresh on every
- * call so a test can reassign either field per-test without re-importing
+/** Indirection seam for the engine's live-only dependencies — the XHR PUT
+ * driver, the download presign + fetch calls, and "the currently connected
+ * client" — so tests can swap in mocks without needing a real wasm client or
+ * network access. Production code never overrides this; it's read fresh on
+ * every call so a test can reassign any field per-test without re-importing
  * the module. */
 export const engineDeps = {
   putWithProgress: (
@@ -25,6 +28,17 @@ export const engineDeps = {
     signal: AbortSignal,
   ): Promise<string> => putWithProgress(url, body, contentType, onProgress, signal),
   getClient: (): WasmClient | null => session.client,
+  /** [B10] Wraps `WasmClient.presign_get` — kept behind the seam (rather
+   * than called directly like `presign_put`/`presign_upload_part`) so
+   * download races can be pinned with a fully controllable deferred promise,
+   * the same way `putWithProgress` is faked. */
+  presignGet: (key: string, expiresSecs: number, attachmentName: string | null): Promise<PresignedRequest> => {
+    const client = engineDeps.getClient();
+    if (!client) return Promise.reject(new Error("not connected"));
+    return Promise.resolve(client.presign_get(key, expiresSecs, attachmentName) as PresignedRequest);
+  },
+  /** [B10] Wraps `fetch` for the download reader loop. */
+  fetchStream: (url: string, signal: AbortSignal): Promise<Response> => fetch(url, { signal }),
 };
 
 export interface Transfer {
@@ -32,11 +46,15 @@ export interface Transfer {
   key: string;
   name: string;
   size: number;
+  /** Upload-only; downloads never go multipart, so this is always "single"
+   * for a download row (dispatch branches on `direction` first — see
+   * `processFile` — so the value is otherwise unused there). */
   kind: "single" | "multipart";
-  status: "queued" | "uploading" | "paused" | "done" | "error" | "cancelled";
-  uploaded: number; // bytes, reactive
+  direction: "upload" | "download"; // [B4]
+  status: "queued" | "uploading" | "downloading" | "paused" | "done" | "error" | "cancelled";
+  transferred: number; // bytes moved so far, either direction, reactive [B4]
   error: string | null;
-  uploadId: string | null; // multipart only
+  uploadId: string | null; // multipart upload only
 }
 
 interface InternalState {
@@ -51,11 +69,15 @@ interface InternalState {
   pending: PartRange[];
   /** `{ part_number, etag }` for parts that have finished (multipart only). */
   completedParts: { part_number: number; etag: string }[];
-  /** Bytes from fully-completed parts — `Transfer.uploaded` adds the
+  /** Bytes from fully-completed parts — `Transfer.transferred` adds the
    * in-flight parts' loaded bytes on top so retries never double-count. */
   completedBytes: number;
   controllers: Set<AbortController>;
   inFlightLoaded: Map<AbortController, number>;
+  /** Download-only: the caller-acquired sink to write chunks into. Never
+   * touched for uploads. Lives here (not on the reactive `Transfer`) per
+   * the same non-serializable-bookkeeping rule as `file`/`controllers`. */
+  writable: FileSystemWritableFileStream | null;
   /** True while `processFile` is on the stack for this transfer (from entry
    * until its `finally` clears it, right before that `finally` calls
    * `pump()`). Lets `pump()` refuse to dispatch a second, concurrent
@@ -110,18 +132,19 @@ async function interruptibleSleep(ms: number, internal: InternalState): Promise<
 function recomputeUploaded(transfer: Transfer, internal: InternalState): void {
   let inFlight = 0;
   for (const loaded of internal.inFlightLoaded.values()) inFlight += loaded;
-  transfer.uploaded = internal.completedBytes + inFlight;
+  transfer.transferred = internal.completedBytes + inFlight;
 }
 
 /** Releases an item's heavy engine-only bookkeeping once its `Transfer.
  * status` has settled into a terminal state ("done" | "error" |
- * "cancelled") — the `File` handle, any `AbortController`s, and the
- * per-part queue/progress data are never touched again for a terminal
- * transfer, so drop the references and let the GC reclaim them (this
- * matters for many-file, large-file sessions left in the panel via
- * `clearFinished()` not yet having run). `Transfer.uploadId` lives on the
- * reactive row itself (not here) and is deliberately left alone — it's
- * still useful for diagnostics after the row settles.
+ * "cancelled") — the `File` handle (uploads), the `writable` sink
+ * (downloads), any `AbortController`s, and the per-part queue/progress data
+ * are never touched again for a terminal transfer, so drop the references
+ * and let the GC reclaim them (this matters for many-file, large-file
+ * sessions left in the panel via `clearFinished()` not yet having run).
+ * `Transfer.uploadId` lives on the reactive row itself (not here) and is
+ * deliberately left alone — it's still useful for diagnostics after the row
+ * settles. [B9]
  *
  * Must only be called as the LAST step of whichever branch finally settles
  * a transfer — `abortEagerly` and `cancel()`'s own abort call still need
@@ -132,6 +155,7 @@ function freeInternal(id: string): void {
   const internal = internals.get(id);
   if (!internal) return;
   internal.file = null;
+  internal.writable = null;
   internal.controllers.clear();
   internal.inFlightLoaded.clear();
   internal.pending = [];
@@ -237,7 +261,7 @@ async function runSingle(
       internal.file!, // set at enqueue(), only nulled after this transfer is terminal
       internal.contentType,
       (loaded) => {
-        transfer.uploaded = loaded;
+        transfer.transferred = loaded;
       },
       controller.signal,
     );
@@ -245,7 +269,7 @@ async function runSingle(
     // The final upload-progress event isn't guaranteed to report the full
     // byte count before `onload` fires — assert it explicitly so the panel
     // never shows a stuck sub-100% bar for a transfer that's actually done.
-    transfer.uploaded = transfer.size;
+    transfer.transferred = transfer.size;
     await finalize(client, transfer, internal, etag);
   } catch (e) {
     internal.controllers.delete(controller);
@@ -380,7 +404,75 @@ async function runMultipart(
   }
 }
 
+/** Streams a presigned GET straight into the caller-acquired `writable`
+ * sink [B2] — no in-memory accumulation. Mirrors the upload engine's unwind
+ * discipline: `internal.controllers` holds the fetch's `AbortController` so
+ * `cancel()`'s existing abort loop covers it for free, and `writable.abort()`
+ * on the cancel path is cancel()'s own responsibility (mirrors how
+ * `abort_multipart_upload` lives in cancel(), not here) [B8]. No pause/
+ * resume for downloads [B5]. */
+async function runDownload(transfer: Transfer, internal: InternalState): Promise<void> {
+  const controller = new AbortController();
+  internal.controllers.add(controller);
+  try {
+    // [B1] presign immediately before dispatch, never ahead of time; the
+    // URL is a bearer token — it's never logged and lives only in this
+    // function's local scope for the duration of the fetch.
+    const presigned = await engineDeps.presignGet(transfer.key, PRESIGN_EXPIRES_SECS, transfer.name);
+    const response = await engineDeps.fetchStream(presigned.url, controller.signal);
+    if (!response.ok || !response.body) {
+      throw new Error(`download failed with status ${response.status}`);
+    }
+    const writable = internal.writable!; // set at enqueueDownload(), only nulled after this transfer is terminal; captured once here (mirrors how the upload engine captures `internal.file` per attempt) so a chunk landing after a cancel can't dereference a nulled field
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        transfer.transferred += value.byteLength;
+        await writable.write(value);
+      }
+    }
+    internal.controllers.delete(controller);
+    if (internal.cancelled) return; // cancel() already aborted the writable; close() must never follow an abort()
+    await writable.close();
+    // As with the upload path, assert the full byte count explicitly rather
+    // than trusting the last chunk to land exactly on `transfer.size`.
+    transfer.transferred = transfer.size;
+    transfer.status = "done";
+    freeInternal(transfer.id);
+  } catch (e) {
+    internal.controllers.delete(controller);
+    if (internal.cancelled) return; // cancel() already set status "cancelled", aborted the writable, and aborted the fetch controller itself
+    transfer.status = "error";
+    transfer.error = errMsg(e);
+    // A write failure or a non-OK response means the response body (if any)
+    // was never fully consumed — abort the fetch too, or the browser is left
+    // pulling bytes into a reader nobody's reading from anymore. Aborting an
+    // already-settled/never-started fetch is a harmless no-op, so this is
+    // safe to call unconditionally on this (non-cancel) branch.
+    controller.abort();
+    try {
+      await internal.writable?.abort();
+    } catch {
+      // best-effort cleanup; the row is already in "error" regardless.
+    }
+    freeInternal(transfer.id);
+  }
+}
+
 async function processFile(transfer: Transfer, internal: InternalState): Promise<void> {
+  if (transfer.direction === "download") {
+    transfer.status = "downloading";
+    internal.running = true;
+    try {
+      await runDownload(transfer, internal);
+    } finally {
+      internal.running = false; // must clear before pump() re-dispatches, else pump would see this run as still active
+      pump();
+    }
+    return;
+  }
   transfer.status = "uploading";
   internal.running = true;
   const client = engineDeps.getClient();
@@ -403,11 +495,14 @@ async function processFile(transfer: Transfer, internal: InternalState): Promise
   }
 }
 
-/** Promotes queued transfers to "uploading" while under the file-
- * concurrency cap. Called after enqueue and after every transfer leaves
- * "uploading" (done/error/cancelled/paused) so the next one starts. */
+/** Promotes queued transfers to "uploading"/"downloading" while under the
+ * shared file-concurrency cap [B6]. Called after enqueue and after every
+ * transfer leaves an active state (done/error/cancelled/paused) so the next
+ * one starts. */
 function pump(): void {
-  const uploading = transfers.items.filter((t) => t.status === "uploading").length;
+  const uploading = transfers.items.filter(
+    (t) => t.status === "uploading" || t.status === "downloading",
+  ).length;
   let free = MAX_CONCURRENT_FILES - uploading;
   if (free <= 0) return;
   for (const transfer of transfers.items) {
@@ -426,6 +521,7 @@ export const transfers: {
   readonly active: boolean;
   activeUploadIds(): string[];
   enqueue(file: File, key: string): void;
+  enqueueDownload(key: string, name: string, size: number, writable: FileSystemWritableFileStream): void;
   pause(id: string): void;
   resume(id: string): void;
   cancel(id: string): Promise<void>;
@@ -436,7 +532,11 @@ export const transfers: {
 
   get active() {
     return transfers.items.some(
-      (t) => t.status === "queued" || t.status === "uploading" || t.status === "paused",
+      (t) =>
+        t.status === "queued" ||
+        t.status === "uploading" ||
+        t.status === "downloading" ||
+        t.status === "paused",
     );
   },
 
@@ -470,8 +570,9 @@ export const transfers: {
       name: file.name,
       size: file.size,
       kind,
+      direction: "upload", // [B4]
       status: "queued",
-      uploaded: 0,
+      transferred: 0,
       error: null,
       uploadId: null,
     };
@@ -483,6 +584,44 @@ export const transfers: {
       completedBytes: 0,
       controllers: new Set(),
       inFlightLoaded: new Map(),
+      writable: null,
+      running: false,
+      paused: false,
+      cancelled: false,
+      completing: false,
+      completed: false,
+    });
+    transfers.items.push(transfer);
+    pump();
+  },
+
+  /** Enqueues a download row for a caller-acquired `writable` sink (Task 3
+   * owns picking it via `showSaveFilePicker`/FSA). Presign is lazy, at
+   * dispatch time [B1]; the row shares the same <=3 concurrent-transfer
+   * slots as uploads [B6] and supports cancel only, never pause/resume
+   * [B5]. */
+  enqueueDownload(key: string, name: string, size: number, writable: FileSystemWritableFileStream) {
+    const transfer: Transfer = {
+      id: crypto.randomUUID(),
+      key,
+      name,
+      size,
+      kind: "single", // unused for downloads; direction gates dispatch first
+      direction: "download", // [B4]
+      status: "queued",
+      transferred: 0,
+      error: null,
+      uploadId: null,
+    };
+    internals.set(transfer.id, {
+      file: null,
+      contentType: "",
+      pending: [],
+      completedParts: [],
+      completedBytes: 0,
+      controllers: new Set(),
+      inFlightLoaded: new Map(),
+      writable,
       running: false,
       paused: false,
       cancelled: false,
@@ -553,18 +692,36 @@ export const transfers: {
         }
       }
     }
+    // [B8] Downloads have no uploadId to abort remotely; instead abort the
+    // writable so no partial file survives on disk. `runDownload`'s own
+    // catch skips this (it no-ops on `internal.cancelled`), so this is the
+    // one place it happens — mirrors `abort_multipart_upload` living here
+    // rather than in `runMultipart`.
+    if (transfer.direction === "download" && internal.writable) {
+      try {
+        await internal.writable.abort();
+      } catch (e) {
+        transfer.error = errMsg(e);
+      }
+    }
     freeInternal(id);
   },
 
-  /** Cancels every non-terminal transfer (queued/uploading/paused) —
-   * e.g. when switching profiles, where letting uploads keep running
-   * against the about-to-be-torn-down session/client makes no sense.
-   * Snapshots the id list before cancelling since `cancel()` mutates
-   * `transfers.items` (via `pump()`) as it goes. Reuses `cancel(id)` so
-   * every abort/status/error-note rule stays in exactly one place. */
+  /** Cancels every non-terminal transfer (queued/uploading/downloading/
+   * paused) — e.g. when switching profiles, where letting transfers keep
+   * running against the about-to-be-torn-down session/client makes no
+   * sense [B8]. Snapshots the id list before cancelling since `cancel()`
+   * mutates `transfers.items` (via `pump()`) as it goes. Reuses `cancel(id)`
+   * so every abort/status/error-note rule stays in exactly one place. */
   async cancelAll() {
     const ids = transfers.items
-      .filter((t) => t.status === "queued" || t.status === "uploading" || t.status === "paused")
+      .filter(
+        (t) =>
+          t.status === "queued" ||
+          t.status === "uploading" ||
+          t.status === "downloading" ||
+          t.status === "paused",
+      )
       .map((t) => t.id);
     await Promise.all(ids.map((id) => transfers.cancel(id)));
   },

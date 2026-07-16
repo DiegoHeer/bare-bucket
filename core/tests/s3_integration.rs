@@ -228,6 +228,69 @@ async fn multipart_roundtrip_via_presigned_descriptors() {
 
 #[serial_test::serial]
 #[tokio::test]
+async fn presigned_get_returns_object_bytes_and_disposition() {
+    let Some(client) = client() else { return };
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let key = format!("it/{run}/presign-get/hello world ü.txt");
+    let body = b"presigned get roundtrip";
+    client
+        .put_object(&key, body, "text/plain", None)
+        .await
+        .expect("seed put");
+
+    let http = reqwest::Client::new();
+
+    // Plain presigned GET (no disposition) — a browser `fetch`/anchor
+    // navigation would hit this exact URL and get the object body back.
+    let plain = client.presign_get(&key, 3600, None);
+    assert_eq!(plain.method, "GET");
+    let response = http.get(&plain.url).send().await.expect("plain get");
+    assert!(
+        response.status().is_success(),
+        "status {}",
+        response.status()
+    );
+    assert!(
+        response.headers().get("content-disposition").is_none(),
+        "no disposition requested, none should be echoed back"
+    );
+    let bytes = response.bytes().await.expect("plain get body");
+    assert_eq!(&bytes[..], &body[..]);
+
+    // With a disposition, the provider echoes it back as a response header —
+    // this is exactly what the universal download fallback (spec §5.2
+    // amendment) relies on to name the saved file.
+    let disposition = r#"attachment; filename="hello world.txt""#;
+    let with_disposition = client.presign_get(&key, 3600, Some(disposition));
+    let response = http
+        .get(&with_disposition.url)
+        .send()
+        .await
+        .expect("disposition get");
+    assert!(
+        response.status().is_success(),
+        "status {}",
+        response.status()
+    );
+    let got_disposition = response
+        .headers()
+        .get("content-disposition")
+        .expect("content-disposition header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(got_disposition, disposition);
+    let bytes = response.bytes().await.expect("disposition get body");
+    assert_eq!(&bytes[..], &body[..]);
+
+    client.delete_object(&key).await.expect("cleanup");
+}
+
+#[serial_test::serial]
+#[tokio::test]
 async fn manifest_conflict_loop_preserves_concurrent_changes() {
     use bare_bucket_core::manifest::{ManifestObject, ManifestStore, MANIFEST_KEY};
 

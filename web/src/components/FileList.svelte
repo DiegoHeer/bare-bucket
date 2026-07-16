@@ -9,7 +9,9 @@
   // Two shapes: the default folder+file listing scoped to `browse.prefix`,
   // or a flat files-only mode (Recent/Favorites/Search) that shows each
   // file's parent path instead of relying on the current prefix.
-  type Props = { listing: Listing; showPath?: false } | { files: ManifestObject[]; showPath: true };
+  type Props = ({ listing: Listing; showPath?: false } | { files: ManifestObject[]; showPath: true }) & {
+    onDownload: (file: ManifestObject) => void;
+  };
 
   let props: Props = $props();
 
@@ -28,7 +30,7 @@
 
 <table>
   <thead>
-    <tr><th class="name">Name</th><th class="num">Size</th><th class="num">Modified</th><th class="star-col"><span class="sr-only">Favorite</span></th></tr>
+    <tr><th class="name">Name</th><th class="num">Size</th><th class="num">Modified</th><th class="actions-col"><span class="sr-only">Actions</span></th></tr>
   </thead>
   <tbody>
     {#each folders as folder (folder.prefix)}
@@ -36,7 +38,7 @@
         <td class="name">📁 {folder.name}</td>
         <td class="num">—</td>
         <td class="num"></td>
-        <td class="star-col"></td>
+        <td class="actions-col"></td>
       </tr>
     {/each}
     {#each files as file (file.key)}
@@ -55,7 +57,16 @@
         </td>
         <td class="num">{formatSize(file.size)}</td>
         <td class="num">{formatModified(file.last_modified)}</td>
-        <td class="star-col">
+        <td class="actions-col">
+          <button
+            class="download"
+            aria-label={`Download ${fileName(file.key)}`}
+            title="Download"
+            onclick={(e) => {
+              e.stopPropagation();
+              props.onDownload(file);
+            }}
+          >⬇</button>
           <button
             class="star"
             class:starred={file.favorite}
@@ -116,12 +127,14 @@
     color: var(--accent);
     text-decoration: underline;
   }
-  th.star-col,
-  td.star-col {
-    width: 30px;
+  th.actions-col,
+  td.actions-col {
+    width: 54px;
     padding: 8px 6px;
+    white-space: nowrap;
   }
-  .star {
+  .star,
+  .download {
     background: none;
     border: none;
     color: var(--text-dim);
@@ -135,6 +148,9 @@
   }
   .star:hover {
     color: var(--star);
+  }
+  .download:hover {
+    color: var(--accent);
   }
   tr.clickable {
     cursor: pointer;

@@ -1,10 +1,11 @@
 <script lang="ts">
+  import type { ManifestObject } from "../lib/core";
   import type { Listing } from "../lib/listing";
   import { iconFor } from "../lib/icons";
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
 
-  let { listing }: { listing: Listing } = $props();
+  let { listing, onDownload }: { listing: Listing; onDownload: (file: ManifestObject) => void } = $props();
 
   function fileName(key: string): string {
     return key.slice(browse.prefix.length);
@@ -20,6 +21,15 @@
   {/each}
   {#each listing.files as file (file.key)}
     <div class="tile">
+      <button
+        class="download"
+        aria-label={`Download ${fileName(file.key)}`}
+        title="Download"
+        onclick={(e) => {
+          e.stopPropagation();
+          onDownload(file);
+        }}
+      >⬇</button>
       <button
         class="star"
         class:starred={file.favorite}
@@ -54,10 +64,10 @@
     color: inherit;
     font: inherit;
   }
-  .star {
+  .star,
+  .download {
     position: absolute;
     top: 4px;
-    right: 4px;
     background: none;
     border: none;
     color: var(--text-dim);
@@ -67,11 +77,20 @@
     padding: 2px;
     z-index: 1;
   }
+  .star {
+    right: 4px;
+  }
+  .download {
+    right: 24px;
+  }
   .star.starred {
     color: var(--star);
   }
   .star:hover {
     color: var(--star);
+  }
+  .download:hover {
+    color: var(--accent);
   }
   button.tile {
     cursor: pointer;
