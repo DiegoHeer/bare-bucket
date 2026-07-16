@@ -41,7 +41,12 @@ function extensionOf(key: string): string {
  */
 export function previewKind(object: Pick<ManifestObject, "key" | "content_type">): PreviewKind {
   const ext = extensionOf(object.key);
-  const contentType = object.content_type.toLowerCase();
+  // Polish item 5: strip any `; charset=...`-style parameter before matching
+  // so e.g. `application/json; charset=utf-8` still routes to the text
+  // renderer instead of falling through to "none" on the exact-match checks
+  // below (the `startsWith` checks already tolerated this by construction,
+  // but the exact-match ones didn't).
+  const contentType = object.content_type.toLowerCase().split(";")[0].trim();
 
   if (contentType.startsWith("image/") || IMAGE_EXTENSIONS.has(ext)) return "image";
   if (contentType === "application/pdf" || ext === "pdf") return "pdf";

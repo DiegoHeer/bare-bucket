@@ -107,10 +107,16 @@
     }
   }
 
-  function preloadImage(url: string): Promise<void> {
+  // Resolves with the probe Image itself (not just void) so a caller whose
+  // token has gone stale by the time this resolves (superseded by a
+  // sibling-nav/close before the decode finished) can clear `probe.src` —
+  // polish item 6: abandoning the load rather than leaving a finished-but-
+  // unused `<img>` holding onto its decoded bytes/presigned URL past the
+  // point anything still needs them.
+  function preloadImage(url: string): Promise<HTMLImageElement> {
     return new Promise((resolve, reject) => {
       const probe = new Image();
-      probe.onload = () => resolve();
+      probe.onload = () => resolve(probe);
       probe.onerror = () => reject(new Error("Image failed to load"));
       probe.src = url;
     });
@@ -135,8 +141,11 @@
         presignedUrl = presigned.url;
 
         if (kind === "image") {
-          await preloadImage(presigned.url);
-          if (token !== previewToken) return;
+          const probe = await preloadImage(presigned.url);
+          if (token !== previewToken) {
+            probe.src = ""; // stale: abandon the now-unused decoded image
+            return;
+          }
           imageUrl = presigned.url;
         } else if (kind === "text") {
           const controller = new AbortController();
@@ -179,8 +188,20 @@
   $effect(() => {
     const canvas = pdfCanvas;
     const page = pdfPage;
-    if (kind === "pdf" && pdfHandle && canvas) {
-      void pdfHandle.renderPage(page, canvas, window.devicePixelRatio || 1);
+    const handle = pdfHandle;
+    if (kind === "pdf" && handle && canvas) {
+      // Polish item 7: a page-navigation render failure (not the initial
+      // doc-open, which `loadPreview`'s own try/catch already covers) used
+      // to reject silently — `void`-ed with nowhere for the rejection to go.
+      // `token` pins this call to the load that was current when it started,
+      // so a failure arriving after the user has already navigated/closed
+      // (superseded by a newer `loadPreview` or unmount) doesn't clobber a
+      // newer preview's state.
+      const token = previewToken;
+      handle.renderPage(page, canvas, window.devicePixelRatio || 1).catch((e) => {
+        if (token !== previewToken) return;
+        previewError = e instanceof Error ? e.message : String(e);
+      });
     }
   });
 

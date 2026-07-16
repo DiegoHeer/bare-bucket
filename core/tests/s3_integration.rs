@@ -599,15 +599,31 @@ async fn reconcile_heals_out_of_band_changes() {
     .await
     .expect("reconcile");
 
-    assert_eq!(report.added, 2, "both data objects discovered");
-    assert_eq!(report.thumbnails_deleted, 1, "orphan thumb removed");
+    // Polish item 15: `reconcile()` LISTs the WHOLE bucket, not just this
+    // test's own `prefix` — a shared bucket left with debris from an earlier
+    // interrupted run (this test or another) contributes extra objects/
+    // thumbs that a strict `==` here would wrongly fail on. Tolerant `>=`
+    // checks confirm THIS run's own additions were seen without asserting
+    // anything about a bucket this test doesn't fully control the contents
+    // of; `uploads_aborted` already used `>=` for the same reason.
+    assert!(report.added >= 2, "both data objects discovered");
+    assert!(report.thumbnails_deleted >= 1, "orphan thumb removed");
     assert!(report.uploads_aborted >= 1, "dangling upload aborted");
 
     // Manifest reflects the bucket; live thumb key was NOT attached (no row
-    // had it) but the thumb object survives for PR 14 to pick up.
+    // had it) but the thumb object survives for PR 14 to pick up. Scoped to
+    // this run's own `prefix` (same pollution reasoning as above) rather than
+    // asserting an exact whole-bucket count.
     let store = ManifestStore::new(&client, "device-it");
     let loaded = store.load().await.expect("load");
-    assert_eq!(loaded.manifest.live_objects().count(), 2);
+    assert_eq!(
+        loaded
+            .manifest
+            .live_objects()
+            .filter(|o| o.key.starts_with(&prefix))
+            .count(),
+        2
+    );
     assert!(loaded.manifest.get(&key_a).is_some());
     assert!(loaded.manifest.last_full_rebuild_at.is_some());
 

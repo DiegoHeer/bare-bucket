@@ -184,7 +184,7 @@ Permanent (no trash). Confirm dialog → object `DELETE` + thumbnail `DELETE` + 
 
 ### 8.1 Profiles
 
-`localStorage`: `{ id, name, endpoint, region, bucket, access_key_id, path_style }`. The access key ID is treated as non-secret (it is an identifier). `path_style` toggles path-style vs virtual-hosted addressing (RustFS/MinIO vs R2/AWS).
+`localStorage`: `{ id, name, endpoint, region, bucket, accessKeyId, pathStyle }` (camelCase — aligned during implementation to match the web client's TypeScript convention; `web/src/lib/profiles.ts` is the source of truth). The access key ID is treated as non-secret (it is an identifier). `pathStyle` toggles path-style vs virtual-hosted addressing (RustFS/MinIO vs R2/AWS).
 
 ### 8.2 Secret key
 

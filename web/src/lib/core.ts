@@ -61,8 +61,9 @@ export interface HeadResult {
 
 // `WasmClient::delete_object`'s report (PR 12, core/src/wasm_api.rs's
 // `DeleteReport`) — snake_case, no serde rename on this struct. `deleted` is
-// currently always `true` (Task 1 interface note): callers must gate success
-// on the returned promise RESOLVING, not on this field.
+// `!already_absent` (polish item 4): callers must still gate success on the
+// returned promise RESOLVING, not on this field — `deleted: false` on an
+// already-tombstoned key is a successful no-op, not a failure.
 export interface DeleteReport {
   deleted: boolean;
   thumbnail_deleted: boolean | null;

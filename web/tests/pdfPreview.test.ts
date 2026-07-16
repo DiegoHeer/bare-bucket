@@ -5,7 +5,7 @@
 // render into anyway), so only the orchestration around the mocked API
 // (doc-open -> numPages, page render plumbing, destroy) is verified here.
 import { describe, expect, it, vi } from "vitest";
-import { clampPage } from "../src/lib/pdfPreview";
+import { clampedPdfRenderScale, clampPage, MAX_PDF_CANVAS_DIMENSION } from "../src/lib/pdfPreview";
 
 describe("clampPage", () => {
   it("clamps below 1 up to 1", () => {
@@ -24,6 +24,32 @@ describe("clampPage", () => {
   it("returns 1 when there are no pages to clamp into", () => {
     expect(clampPage(3, 0)).toBe(1);
     expect(clampPage(1, -1)).toBe(1);
+  });
+});
+
+describe("clampedPdfRenderScale", () => {
+  it("returns the requested scale unchanged when the result fits under the cap", () => {
+    expect(clampedPdfRenderScale(612, 792, 2)).toBe(2); // a normal US-letter page at 2x DPR
+  });
+
+  it("scales down a pathologically large page so its long edge lands exactly on the cap", () => {
+    const scale = clampedPdfRenderScale(20000, 10000, 1);
+    expect(20000 * scale).toBeCloseTo(MAX_PDF_CANVAS_DIMENSION);
+    expect(10000 * scale).toBeLessThan(MAX_PDF_CANVAS_DIMENSION);
+  });
+
+  it("scales down for an inflated devicePixelRatio on an otherwise-normal page", () => {
+    const scale = clampedPdfRenderScale(612, 792, 10); // absurd DPR
+    expect(792 * scale).toBeCloseTo(MAX_PDF_CANVAS_DIMENSION);
+  });
+
+  it("clamps against a portrait page's long edge (height), not just width", () => {
+    const scale = clampedPdfRenderScale(1000, 20000, 1);
+    expect(20000 * scale).toBeCloseTo(MAX_PDF_CANVAS_DIMENSION);
+  });
+
+  it("honors a custom maxDimension override", () => {
+    expect(clampedPdfRenderScale(1000, 1000, 1, 500)).toBeCloseTo(0.5);
   });
 });
 

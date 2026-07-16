@@ -240,6 +240,9 @@ const secondDeleteReport = await client.delete_object(deleteKey);
 if (secondDeleteReport.already_absent !== true) {
   throw new Error(`re-deleting an already-tombstoned key must report already_absent: ${JSON.stringify(secondDeleteReport)}`);
 }
+if (secondDeleteReport.deleted !== false) {
+  throw new Error(`re-deleting an already-tombstoned key must report deleted: false: ${JSON.stringify(secondDeleteReport)}`);
+}
 console.log("delete_object already-tombstoned short-circuit: ok");
 
 // reconcile keeps the tombstone consistent: rerunning it must not resurrect

@@ -13,6 +13,8 @@ import { partRanges, putWithProgress, type PartRange, type PutProgress } from ".
 import { session } from "./session.svelte";
 import { previewKind } from "./preview";
 import { generateThumbFor, uploadThumb } from "./thumbs";
+import { displayName } from "./listing";
+import { shouldWriteProgress, type ProgressPoint } from "./progressThrottle";
 import type { PresignedRequest, UploadPlan, WasmClient } from "./core";
 
 // Mirrors core/src/manifest.rs's `RESERVED_PREFIX` ([B10]) — no shared
@@ -143,7 +145,12 @@ interface InternalState {
 
 const MAX_CONCURRENT_FILES = 3;
 const MAX_CONCURRENT_PARTS = 3;
-const PRESIGN_EXPIRES_SECS = 3600;
+// Polish item 2: the one exported copy of this constant — BrowseScreen.svelte
+// imports it instead of keeping its own local duplicate. The other sites
+// (GridThumb.svelte/Lightbox.svelte/generateMissing.svelte.ts/thumbs.ts) keep
+// their own copies per their own comments; consolidating those is out of
+// this fix's scope.
+export const PRESIGN_EXPIRES_SECS = 3600;
 const COMPLETE_RETRY_DELAYS_MS = [1000, 2000]; // [B2]: 3 attempts total, 1s/2s backoff between them
 const CANCEL_POLL_MS = 100; // tick size for interruptible backoff sleeps during Complete retry
 
@@ -323,12 +330,20 @@ async function runSingle(
   try {
     // [B1] presign immediately before dispatch, never ahead of time.
     const presigned = client.presign_put(transfer.key, PRESIGN_EXPIRES_SECS) as PresignedRequest;
+    // [B2, item 13] Throttles the reactive `transfer.transferred` write —
+    // the terminal value is always asserted explicitly right after this
+    // resolves (below), regardless of what the throttle let through.
+    let lastWrite: ProgressPoint = { bytes: 0, at: Date.now() };
     const etag = await engineDeps.putWithProgress(
       presigned.url,
       internal.file!, // set at enqueue(), only nulled after this transfer is terminal
       internal.contentType,
       (loaded) => {
-        transfer.transferred = loaded;
+        const next: ProgressPoint = { bytes: loaded, at: Date.now() };
+        if (shouldWriteProgress(lastWrite, next, transfer.size)) {
+          transfer.transferred = loaded;
+          lastWrite = next;
+        }
       },
       controller.signal,
     );
@@ -360,6 +375,13 @@ async function uploadPart(
     const controller = new AbortController();
     internal.controllers.add(controller);
     internal.inFlightLoaded.set(controller, 0);
+    // [B2, item 13] Throttles the reactive `recomputeUploaded` write, scoped
+    // to THIS part's own byte count (not the whole transfer's) since `loaded`
+    // here is this part's XHR progress only. `internal.inFlightLoaded` — the
+    // non-reactive bookkeeping `recomputeUploaded` sums across parts — is
+    // still updated on every event regardless of the throttle, so the eventual
+    // (possibly-delayed) reactive write stays byte-accurate.
+    let lastWrite: ProgressPoint = { bytes: 0, at: Date.now() };
     try {
       // [B1] lazy per-part presign, right before this attempt's dispatch.
       const presigned = client.presign_upload_part(
@@ -375,7 +397,11 @@ async function uploadPart(
         internal.contentType,
         (loaded) => {
           internal.inFlightLoaded.set(controller, loaded);
-          recomputeUploaded(transfer, internal);
+          const next: ProgressPoint = { bytes: loaded, at: Date.now() };
+          if (shouldWriteProgress(lastWrite, next, part.end - part.start)) {
+            recomputeUploaded(transfer, internal);
+            lastWrite = next;
+          }
         },
         controller.signal,
       );
@@ -492,11 +518,23 @@ async function runDownload(transfer: Transfer, internal: InternalState): Promise
     }
     const writable = internal.writable!; // set at enqueueDownload(), only nulled after this transfer is terminal; captured once here (mirrors how the upload engine captures `internal.file` per attempt) so a chunk landing after a cancel can't dereference a nulled field
     const reader = response.body.getReader();
+    // [B2, item 13] `receivedBytes` is the true running total, updated on
+    // EVERY chunk regardless of the throttle (`writable.write` and the
+    // terminal `transfer.transferred = transfer.size` below both need it to
+    // be byte-accurate); only the reactive `transfer.transferred` write
+    // itself is throttled.
+    let receivedBytes = 0;
+    let lastWrite: ProgressPoint = { bytes: 0, at: Date.now() };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (value) {
-        transfer.transferred += value.byteLength;
+        receivedBytes += value.byteLength;
+        const next: ProgressPoint = { bytes: receivedBytes, at: Date.now() };
+        if (shouldWriteProgress(lastWrite, next, transfer.size)) {
+          transfer.transferred = receivedBytes;
+          lastWrite = next;
+        }
         await writable.write(value);
       }
     }
@@ -634,7 +672,12 @@ export const transfers: {
     const transfer: Transfer = {
       id: crypto.randomUUID(),
       key,
-      name: file.name,
+      // Polish item 1: derived from the TARGET key's basename, not the
+      // source File's own name — for the common case these are identical,
+      // but a "Save as a copy" conflict resolution enqueues under a renamed
+      // key (see resolveSaveAsCopy in BrowseScreen.svelte), and the panel row
+      // must show that renamed name, not the original file's.
+      name: displayName(key).name,
       size: file.size,
       kind,
       direction: "upload", // [B4]

@@ -193,6 +193,58 @@ describe("generateMissing.start", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+});
+
+describe("generateMissing.reset", () => {
+  it("clears every visible field and sets cancelled, whether or not a run was active", () => {
+    generateMissing.running = true;
+    generateMissing.total = 5;
+    generateMissing.done = 2;
+    generateMissing.failed = 1;
+    generateMissing.currentKey = "a.png";
+    generateMissing.cancelled = false;
+
+    generateMissing.reset();
+
+    expect(generateMissing.running).toBe(false);
+    expect(generateMissing.total).toBe(0);
+    expect(generateMissing.done).toBe(0);
+    expect(generateMissing.failed).toBe(0);
+    expect(generateMissing.currentKey).toBeNull();
+    expect(generateMissing.cancelled).toBe(true);
+  });
+
+  it("stops an in-flight run before its next item and leaves counts reset, not reflecting a partial run", async () => {
+    const objects = [obj("a.png"), obj("b.png")];
+    generateMissingDeps.presignGet = vi.fn((_client, key) => presignedGet(`https://example.test/${key}`));
+    generateMissingDeps.uploadThumb = vi.fn(async (_client, key) => ({
+      thumbnailKey: `thumbs/${key}.webp`,
+      updated: true,
+    }));
+    generateMissingDeps.applyThumbnail = vi.fn();
+    let releaseFirst!: () => void;
+    const firstItemGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+    generateMissingDeps.generateThumb = vi.fn(async () => {
+      await firstItemGate;
+      return new Blob(["x"]);
+    });
+
+    const run = generateMissing.start({} as unknown as WasmClient, manifestOf(objects));
+    expect(generateMissing.running).toBe(true);
+
+    generateMissing.reset();
+    expect(generateMissing.running).toBe(false);
+    expect(generateMissing.total).toBe(0);
+
+    // The already-dispatched first item still finishes in the background —
+    // `reset()` doesn't (and can't) abort work already in flight, only stop
+    // the loop from starting anything further and clear what's visible.
+    releaseFirst();
+    await run;
+    expect(generateMissing.running).toBe(false); // start()'s own finally re-set it; still false, harmless
+    expect(generateMissing.total).toBe(0); // not resurrected by the run's own bookkeeping
+  });
+
   it("is a no-op re-entrantly while a run is already active", async () => {
     let releaseFirst!: () => void;
     const firstItemGate = new Promise<void>((resolve) => (releaseFirst = resolve));

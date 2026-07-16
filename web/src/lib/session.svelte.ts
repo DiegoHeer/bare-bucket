@@ -9,6 +9,14 @@ import {
 } from "./core";
 import type { Profile } from "./profiles";
 import { transfers } from "./transfers.svelte";
+// Polish items 10/11: session.disconnect()/connect() reset the "generate
+// missing thumbnails" runner's visible state. generateMissing.svelte.ts
+// already imports `session` (and `transfers`) itself, so this import is
+// mutually circular — same shape as the existing session.svelte.ts <->
+// transfers.svelte.ts pair above, which already works because both sides
+// only touch each other's exports from inside function bodies, never at
+// module-evaluation time.
+import { generateMissing } from "./generateMissing.svelte";
 
 interface Session {
   status: "connect" | "connected";
@@ -53,8 +61,11 @@ function deviceId(): string {
 }
 
 /** Network-shaped failures from the browser usually mean missing bucket
- * CORS rules — the #1 setup failure (spec §8.4). */
-function describeError(e: unknown): string {
+ * CORS rules — the #1 setup failure (spec §8.4). Exported (polish item 3) so
+ * BrowseScreen.svelte's downloadFile can format its own failures the same
+ * way before surfacing them through `session.refreshError`'s existing
+ * inline-banner/chip affordance, rather than growing a second error format. */
+export function describeError(e: unknown): string {
   const message = e instanceof Error ? e.message : String(e);
   if (/network error|failed to fetch|networkerror/i.test(message)) {
     return `${message} — if the endpoint is reachable, your bucket is likely missing CORS rules; see the setup docs.`;
@@ -78,6 +89,11 @@ export const session: Session = $state({
     session.connecting = true;
     session.error = null;
     session.refreshError = null;
+    // Polish item 11: defensive reset in case a previous session's
+    // disconnect() didn't run through the normal teardown path (or a future
+    // call site forgets to) — a stale "Generating…"/summary from the last
+    // connection must never bleed into this one.
+    generateMissing.reset();
     let client: WasmClient | undefined;
     try {
       client = createClient({
@@ -142,6 +158,11 @@ export const session: Session = $state({
     } catch {
       /* mid-flight borrow; GC fallback */
     }
+    // Polish item 10: cancel + immediately reset an active generate-missing
+    // run — its client is being torn down right here, so it must not keep
+    // running (or keep showing a "Generating…" banner) against a session
+    // that's already gone.
+    generateMissing.reset();
     session.status = "connect";
     session.client = null; // drops the wasm instance and the secret with it
     session.manifest = null;
@@ -250,8 +271,9 @@ export const session: Session = $state({
    * (object DELETE + best-effort thumbnail DELETE + manifest tombstone, all
    * under one write lock) and only applies the local tombstone once that
    * call has SETTLED SUCCESSFULLY — gated on the promise resolving, not on
-   * the report's `deleted` field (always `true` today; Task 1's interface
-   * note). Any rejection (reserved-prefix, a genuine object-delete failure,
+   * the report's `deleted` field (`!already_absent`; polish item 4 — a
+   * `deleted: false` on an already-tombstoned key is still a success). Any
+   * rejection (reserved-prefix, a genuine object-delete failure,
    * manifest-conflict exhaustion) propagates to the caller instead of being
    * swallowed here, so the confirm modal can show it and the manifest stays
    * untouched — no optimistic removal. A `thumbnail_deleted === false`

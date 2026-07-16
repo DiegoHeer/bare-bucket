@@ -15,6 +15,33 @@
 // smoke test of the handle's shape/destroy behavior).
 import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
 
+/** Polish item 8: neither edge of a rendered PDF canvas is allowed to exceed
+ * this many device pixels — a guard against a pathological page's own MediaBox
+ * (e.g. a giant poster-size PDF) or an inflated `devicePixelRatio` producing a
+ * canvas the browser can't allocate (canvas dimension limits are commonly
+ * ~16-32k px, but the real-world failure mode is exhausting memory well
+ * before that). 4096 comfortably covers any realistic display/DPR combo. */
+export const MAX_PDF_CANVAS_DIMENSION = 4096;
+
+/**
+ * Scale to actually render at, given the page's UNSCALED (`scale: 1`)
+ * viewport dimensions and the caller's requested `devicePixelRatio`: the
+ * requested scale, unless it would put either edge over
+ * `maxDimension`, in which case it's scaled down (preserving aspect ratio)
+ * so the longer edge lands exactly on the cap. Pure so this is unit-testable
+ * without pdf.js/canvas.
+ */
+export function clampedPdfRenderScale(
+  unscaledWidth: number,
+  unscaledHeight: number,
+  devicePixelRatio: number,
+  maxDimension: number = MAX_PDF_CANVAS_DIMENSION,
+): number {
+  const longEdge = Math.max(unscaledWidth, unscaledHeight) * devicePixelRatio;
+  if (longEdge <= maxDimension) return devicePixelRatio;
+  return devicePixelRatio * (maxDimension / longEdge);
+}
+
 export interface PdfHandle {
   numPages: number;
   /** Renders `pageNumber` (1-based) into `canvas` at a devicePixelRatio-aware
@@ -64,11 +91,22 @@ export async function loadPdf(url: string): Promise<PdfHandle> {
         renderTask.cancel();
         renderTask = null;
       }
-      const viewport = page.getViewport({ scale: devicePixelRatio });
+      // [Polish item 8] Clamp the actual render scale against the page's
+      // own unscaled size so a pathological page/DPR combo can't allocate an
+      // oversized canvas — shared by both this lightbox preview (a real
+      // `devicePixelRatio`) and thumbs.ts's page-1 full-res render
+      // (`devicePixelRatio: 1`), since both route through this one method.
+      // CSS display size is pinned to the page's own unscaled dimensions
+      // regardless of any clamping, so the on-screen size never changes —
+      // only the backing canvas resolution does, in the rare pathological
+      // case.
+      const unscaled = page.getViewport({ scale: 1 });
+      const scale = clampedPdfRenderScale(unscaled.width, unscaled.height, devicePixelRatio);
+      const viewport = page.getViewport({ scale });
       canvas.width = viewport.width;
       canvas.height = viewport.height;
-      canvas.style.width = `${viewport.width / devicePixelRatio}px`;
-      canvas.style.height = `${viewport.height / devicePixelRatio}px`;
+      canvas.style.width = `${unscaled.width}px`;
+      canvas.style.height = `${unscaled.height}px`;
 
       const task = page.render({ canvas, viewport });
       renderTask = task;

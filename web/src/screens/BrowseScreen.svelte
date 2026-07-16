@@ -9,8 +9,8 @@
   import DeleteConfirmModal from "../components/DeleteConfirmModal.svelte";
   import Lightbox from "../components/Lightbox.svelte";
   import { browse } from "../lib/browse.svelte";
-  import { session } from "../lib/session.svelte";
-  import { transfers, keysInStatus } from "../lib/transfers.svelte";
+  import { session, describeError } from "../lib/session.svelte";
+  import { transfers, keysInStatus, PRESIGN_EXPIRES_SECS } from "../lib/transfers.svelte";
   import { anchorDownload, pickSaveTarget, supportsFsa } from "../lib/download";
   import { folderLabel, hasConflict, takenNamesInPrefix } from "../lib/conflicts";
   import { advanceOrClose, nextSiblingKey, siblingKeys } from "../lib/preview";
@@ -24,12 +24,6 @@
     totalSize,
   } from "../lib/listing";
   import type { ManifestObject, PresignedRequest } from "../lib/core";
-
-  // Mirrors transfers.svelte.ts's own `PRESIGN_EXPIRES_SECS` engine constant
-  // (used for the FSA path's own lazy presign, inside `enqueueDownload`) —
-  // kept as a separate constant here rather than importing it, so this task
-  // doesn't have to touch the transfer engine module.
-  const PRESIGN_EXPIRES_SECS = 3600;
 
   interface QueuedConflict {
     id: string;
@@ -99,22 +93,37 @@
    * plain `http://` origin — the FSA/secure-context prerequisite fails
    * there), fall back to navigating a presigned, `attachment`-dispositioned
    * URL: the browser's own download manager takes it from there, so there's
-   * no transfer row for this path. */
+   * no transfer row for this path.
+   *
+   * Polish item 3: this is invoked fire-and-forget from row/lightbox click
+   * handlers (no caller ever awaits or catches it), so a rejection here
+   * would otherwise become a silent unhandled promise rejection — the user
+   * just sees nothing happen. `pickSaveTarget` already swallows a user
+   * cancel (`AbortError`) into a `null` return, so anything that reaches the
+   * catch below is a genuine picker/presign failure; it's surfaced through
+   * `session.refreshError` — the same inline banner (BrowseScreen) / chip
+   * (TopBar) affordance already used for a failed manual refresh — rather
+   * than building a new UI surface for it. */
   async function downloadFile(object: ManifestObject) {
     const name = displayName(object.key).name;
-    if (supportsFsa()) {
-      const writable = await pickSaveTarget(name);
-      if (!writable) return; // user cancelled the picker — not an error
-      transfers.enqueueDownload(object.key, name, object.size, writable);
-      return;
+    try {
+      if (supportsFsa()) {
+        const writable = await pickSaveTarget(name);
+        if (!writable) return; // user cancelled the picker — not an error
+        transfers.enqueueDownload(object.key, name, object.size, writable);
+        return;
+      }
+      if (!session.client) return;
+      const presigned = session.client.presign_get(
+        object.key,
+        PRESIGN_EXPIRES_SECS,
+        name,
+      ) as PresignedRequest;
+      anchorDownload(presigned.url);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return; // defensive; pickSaveTarget already swallows this itself
+      session.refreshError = describeError(e);
     }
-    if (!session.client) return;
-    const presigned = session.client.presign_get(
-      object.key,
-      PRESIGN_EXPIRES_SECS,
-      name,
-    ) as PresignedRequest;
-    anchorDownload(presigned.url);
   }
 
   function onFileInputChange(e: Event) {
