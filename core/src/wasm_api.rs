@@ -373,10 +373,16 @@ impl WasmClient {
             .await
             .map_err(js_error)?;
 
+        // Polish item 4: `deleted` mirrors whether this call itself made the
+        // key go from live to tombstoned, rather than a constant `true` that
+        // couldn't distinguish "I just deleted it" from "it was already
+        // gone" (that distinction is `already_absent`'s job, but `deleted`
+        // read as a lie on the already-absent path before this fix).
+        let already_absent = outcome.is_none();
         to_js(&DeleteReport {
-            deleted: true,
+            deleted: !already_absent,
             thumbnail_deleted,
-            already_absent: outcome.is_none(),
+            already_absent,
         })
     }
 

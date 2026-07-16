@@ -271,8 +271,9 @@ export const session: Session = $state({
    * (object DELETE + best-effort thumbnail DELETE + manifest tombstone, all
    * under one write lock) and only applies the local tombstone once that
    * call has SETTLED SUCCESSFULLY — gated on the promise resolving, not on
-   * the report's `deleted` field (always `true` today; Task 1's interface
-   * note). Any rejection (reserved-prefix, a genuine object-delete failure,
+   * the report's `deleted` field (`!already_absent`; polish item 4 — a
+   * `deleted: false` on an already-tombstoned key is still a success). Any
+   * rejection (reserved-prefix, a genuine object-delete failure,
    * manifest-conflict exhaustion) propagates to the caller instead of being
    * swallowed here, so the confirm modal can show it and the manifest stays
    * untouched — no optimistic removal. A `thumbnail_deleted === false`
