@@ -59,6 +59,16 @@ export interface HeadResult {
   size: number;
 }
 
+// `WasmClient::delete_object`'s report (PR 12, core/src/wasm_api.rs's
+// `DeleteReport`) — snake_case, no serde rename on this struct. `deleted` is
+// currently always `true` (Task 1 interface note): callers must gate success
+// on the returned promise RESOLVING, not on this field.
+export interface DeleteReport {
+  deleted: boolean;
+  thumbnail_deleted: boolean | null;
+  already_absent: boolean;
+}
+
 let initialized: Promise<void> | null = null;
 
 /** Idempotent wasm module initialization. */

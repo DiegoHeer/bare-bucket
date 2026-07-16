@@ -5,7 +5,19 @@
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
 
-  let { listing, onDownload }: { listing: Listing; onDownload: (file: ManifestObject) => void } = $props();
+  let {
+    listing,
+    onDownload,
+    onDelete,
+    deleteBlockedKeys,
+  }: {
+    listing: Listing;
+    onDownload: (file: ManifestObject) => void;
+    onDelete: (file: ManifestObject) => void;
+    /** Keys with an in-flight transfer (queued/uploading/paused/downloading)
+     * [B7] — the tile's delete button is disabled for these. */
+    deleteBlockedKeys: Set<string>;
+  } = $props();
 
   function fileName(key: string): string {
     return key.slice(browse.prefix.length);
@@ -40,6 +52,16 @@
           void session.toggleFavorite(file.key);
         }}
       >{file.favorite ? "★" : "☆"}</button>
+      <button
+        class="delete"
+        aria-label={`Delete ${fileName(file.key)}`}
+        title={deleteBlockedKeys.has(file.key) ? "Can't delete while a transfer is in progress" : "Delete"}
+        disabled={deleteBlockedKeys.has(file.key)}
+        onclick={(e) => {
+          e.stopPropagation();
+          onDelete(file);
+        }}
+      >🗑</button>
       <span class="thumb">{iconFor(file.content_type)}</span>
       <span class="caption">{fileName(file.key)}</span>
     </div>
@@ -65,7 +87,8 @@
     font: inherit;
   }
   .star,
-  .download {
+  .download,
+  .delete {
     position: absolute;
     top: 4px;
     background: none;
@@ -83,6 +106,9 @@
   .download {
     right: 24px;
   }
+  .delete {
+    right: 44px;
+  }
   .star.starred {
     color: var(--star);
   }
@@ -91,6 +117,13 @@
   }
   .download:hover {
     color: var(--accent);
+  }
+  .delete:hover:not(:disabled) {
+    color: var(--danger);
+  }
+  .delete:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
   button.tile {
     cursor: pointer;

@@ -160,4 +160,63 @@ const reupsertedRow = afterReupsert.objects.find((o) => o.key === uploadKey);
 if (reupsertedRow.thumbnail_key !== null) throw new Error("thumbnail_key must be cleared when etag changes");
 console.log("upsert_object etag-change clears thumbnail_key: ok");
 
+// delete_object: upload -> delete -> tombstone visible in load_manifest ->
+// reconcile keeps it consistent (delete already ran the tombstone write, so
+// reconcile should see no further changes to this row).
+const deleteKey = `smoke/delete-roundtrip-${Date.now()}.txt`;
+const presignedForDelete = client.presign_put(deleteKey, 60);
+const putForDeleteResponse = await fetch(presignedForDelete.url, {
+  method: "PUT",
+  body: "to be deleted",
+  headers: { "content-type": "text/plain" },
+});
+if (!putForDeleteResponse.ok) throw new Error(`presigned PUT (for delete) failed: ${putForDeleteResponse.status}`);
+const headedForDelete = await client.head_object(deleteKey);
+await client.upsert_object(deleteKey, headedForDelete.size, headedForDelete.etag, "text/plain");
+
+const deleteReport = await client.delete_object(deleteKey);
+if (deleteReport.deleted !== true) throw new Error(`delete_object did not report deleted: ${JSON.stringify(deleteReport)}`);
+if (deleteReport.thumbnail_deleted !== null) {
+  // No thumbnail was ever attached to this row, so the report must carry null.
+  throw new Error(`expected null thumbnail_deleted, got: ${JSON.stringify(deleteReport)}`);
+}
+if (deleteReport.already_absent !== false) {
+  throw new Error(`row was live before delete, already_absent must be false: ${JSON.stringify(deleteReport)}`);
+}
+console.log("delete_object: ok,", JSON.stringify(deleteReport));
+
+const afterDelete = await client.load_manifest();
+const tombstoned = afterDelete.objects.find((o) => o.key === deleteKey);
+if (!tombstoned) throw new Error("delete_object did not leave a manifest row (tombstones must be retained)");
+if (tombstoned.deleted_at === null) throw new Error("tombstoned row must have deleted_at set");
+console.log("delete_object tombstone visible in load_manifest: ok");
+
+// A second delete_object call on the same (already-tombstoned) key must be a
+// no-op manifest write, reported via already_absent.
+const secondDeleteReport = await client.delete_object(deleteKey);
+if (secondDeleteReport.already_absent !== true) {
+  throw new Error(`re-deleting an already-tombstoned key must report already_absent: ${JSON.stringify(secondDeleteReport)}`);
+}
+console.log("delete_object already-tombstoned short-circuit: ok");
+
+// reconcile keeps the tombstone consistent: rerunning it must not resurrect
+// or otherwise disturb the deleted row (it is gone from the bucket LIST, so
+// reconcile drops it from the manifest entirely — never surfaced as live).
+await client.reconcile([]);
+const afterReconcile = await client.load_manifest();
+if (afterReconcile.objects.some((o) => o.key === deleteKey)) {
+  throw new Error("reconcile must not resurrect a deleted object");
+}
+console.log("reconcile after delete_object: ok");
+
+// Reserved-prefix rejection: must throw before any network call.
+let reservedThrew = false;
+try {
+  await client.delete_object(".bare-bucket/manifest.json.gz");
+} catch {
+  reservedThrew = true;
+}
+if (!reservedThrew) throw new Error("delete_object on a reserved-prefix key must throw");
+console.log("delete_object reserved-prefix rejection: ok");
+
 console.log("SMOKE OK");
