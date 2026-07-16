@@ -1,6 +1,13 @@
 // App-level session state (Svelte 5 runes). One connection at a time.
-import { createClient, type Manifest, type ReconcileReport, type WasmClient } from "./core";
+import {
+  createClient,
+  type Manifest,
+  type ManifestObject,
+  type ReconcileReport,
+  type WasmClient,
+} from "./core";
 import type { Profile } from "./profiles";
+import { transfers } from "./transfers.svelte";
 
 interface Session {
   status: "connect" | "connected";
@@ -17,6 +24,7 @@ interface Session {
   disconnect(): void;
   clearError(): void;
   toggleFavorite(key: string): Promise<void>;
+  applyUpsert(object: ManifestObject): void;
 }
 
 const DEVICE_ID_KEY = "bare-bucket/device-id";
@@ -80,7 +88,10 @@ export const session: Session = $state({
       await client.validate();
       // refresh-on-open + first-connect bootstrap (spec §6); capture the
       // report so a degraded-provider warning is visible immediately.
-      session.lastReport = (await client.reconcile([])) as ReconcileReport;
+      // [B7] activeUploadIds() so a fresh connect never races an upload
+      // that started before this session existed (there shouldn't be one,
+      // but reconcile's contract takes the list regardless).
+      session.lastReport = (await client.reconcile(transfers.activeUploadIds())) as ReconcileReport;
       session.manifest = (await client.load_manifest()) as Manifest;
       session.client = client;
       session.profileName = profile.name;
@@ -108,7 +119,11 @@ export const session: Session = $state({
     session.refreshing = true;
     session.refreshError = null;
     try {
-      session.lastReport = (await session.client.reconcile([])) as ReconcileReport;
+      // [B7] never abort an in-flight multipart upload out from under the
+      // user just because they hit Refresh.
+      session.lastReport = (await session.client.reconcile(
+        transfers.activeUploadIds(),
+      )) as ReconcileReport;
       session.manifest = (await session.client.load_manifest()) as Manifest;
     } catch (e) {
       session.refreshError = describeError(e);
@@ -164,5 +179,31 @@ export const session: Session = $state({
     } finally {
       favoriteInflight.delete(key);
     }
+  },
+
+  /** Local manifest upsert after a completed upload [B8][B10] — avoids a
+   * full refresh() round-trip. `object`'s `favorite`/`thumbnail_key` are
+   * ignored on input and recomputed here from any existing row, mirroring
+   * `WasmClient::upsert_object`'s preservation rule (core/src/wasm_api.rs):
+   * favorite always carries over; thumbnail_key carries over only when the
+   * existing row's etag matches the new one, else it's cleared. A
+   * tombstoned existing row (deleted_at !== null) is treated as absent —
+   * re-uploading over a deleted key is a fresh object, not a restore, so it
+   * must not inherit a stale favorite/thumbnail. Keep in sync with
+   * core/src/wasm_api.rs's upsert_object. */
+  applyUpsert(object: ManifestObject) {
+    if (!session.manifest) return;
+    const objects = session.manifest.objects;
+    const found = objects.find((o) => o.key === object.key);
+    const existing = found && found.deleted_at === null ? found : null;
+    const merged: ManifestObject = {
+      ...object,
+      favorite: existing ? existing.favorite : false,
+      thumbnail_key: existing && existing.etag === object.etag ? existing.thumbnail_key : null,
+      deleted_at: null,
+    };
+    const index = objects.findIndex((o) => o.key === object.key);
+    if (index >= 0) objects[index] = merged;
+    else objects.push(merged);
   },
 });

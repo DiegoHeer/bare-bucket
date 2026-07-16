@@ -43,6 +43,12 @@ pub struct PutResult {
     pub etag: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct HeadResult {
+    pub etag: String,
+    pub size: u64,
+}
+
 pub struct S3Client {
     config: S3Config,
     scheme: String,
@@ -305,6 +311,26 @@ impl S3Client {
         self.send(reqwest::Method::DELETE, Some(key), &[], &[], None)
             .await
             .map(|_| ())
+    }
+
+    /// HEAD an object; `Ok(None)` when it does not exist. Unlike
+    /// [`Self::head_bucket`], a 404 here really does mean "no such object"
+    /// (that method's key is `None`, so `classify`'s 404 arm can't be
+    /// distinguishing bucket-vs-object there the way it can here).
+    pub async fn head_object(&self, key: &str) -> Result<Option<HeadResult>, S3Error> {
+        let response = match self
+            .send(reqwest::Method::HEAD, Some(key), &[], &[], None)
+            .await
+        {
+            Ok(response) => response,
+            Err(S3Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let etag = required_header(&response, "etag")?;
+        let size = required_header(&response, "content-length")?
+            .parse::<u64>()
+            .map_err(|_| S3Error::InvalidResponse("invalid content-length header".into()))?;
+        Ok(Some(HeadResult { etag, size }))
     }
 }
 

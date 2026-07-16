@@ -4,8 +4,12 @@
   import Breadcrumbs from "../components/Breadcrumbs.svelte";
   import FileList from "../components/FileList.svelte";
   import FileGrid from "../components/FileGrid.svelte";
+  import TransferPanel from "../components/TransferPanel.svelte";
+  import ConflictModal from "../components/ConflictModal.svelte";
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
+  import { transfers } from "../lib/transfers.svelte";
+  import { folderLabel, hasConflict, takenNamesInPrefix } from "../lib/conflicts";
   import {
     childEntries,
     favoriteFiles,
@@ -14,6 +18,95 @@
     searchFiles,
     totalSize,
   } from "../lib/listing";
+
+  interface QueuedConflict {
+    id: string;
+    file: File;
+    key: string;
+    prefix: string;
+  }
+
+  let fileInput: HTMLInputElement | undefined = $state();
+  let contentEl: HTMLDivElement | undefined = $state();
+  let isDragging = $state(false);
+  let conflictQueue = $state<QueuedConflict[]>([]);
+  const currentConflict = $derived(conflictQueue[0] ?? null);
+
+  // Transfer keys still actually "in flight" — a cancelled or errored-out
+  // transfer never lands, so its key doesn't occupy anything. Shared by
+  // both the conflict check below and the taken-names set handed to the
+  // modal (same set, same reasoning).
+  const inFlightKeys = $derived(
+    transfers.items
+      .filter((t) => t.status === "queued" || t.status === "uploading" || t.status === "paused")
+      .map((t) => t.key),
+  );
+
+  /** Routes a batch of dropped/picked files through the conflict pipeline
+   * (spec §8.3): files whose target key already names a live manifest
+   * object, or an in-flight transfer's target, are queued for the modal
+   * (one at a time); everything else enqueues immediately. The target key
+   * snapshots `browse.prefix` now — later navigation never retargets an
+   * in-flight upload. */
+  function handleFiles(files: globalThis.FileList | File[]) {
+    const prefix = browse.prefix;
+    const objects = session.manifest?.objects ?? [];
+    for (const file of Array.from(files)) {
+      const key = prefix + file.name;
+      if (hasConflict(objects, key, inFlightKeys)) {
+        conflictQueue.push({ id: crypto.randomUUID(), file, key, prefix });
+      } else {
+        transfers.enqueue(file, key);
+      }
+    }
+  }
+
+  function onFileInputChange(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    if (input.files) handleFiles(input.files);
+    input.value = ""; // allow re-picking the same file(s)
+  }
+
+  function onDragEnter(e: DragEvent) {
+    if (!e.dataTransfer?.types.includes("Files")) return;
+    e.preventDefault();
+    isDragging = true;
+  }
+  function onDragOver(e: DragEvent) {
+    if (!e.dataTransfer?.types.includes("Files")) return;
+    e.preventDefault();
+  }
+  // Rather than a simple enter/leave counter (which can get stuck "open" if
+  // the drag exits the browser window entirely and no matching dragleave
+  // fires for every nested dragenter), check whether the pointer actually
+  // left `contentEl`'s subtree — `relatedTarget` is null when leaving the
+  // window, and unrelated otherwise, so both cases correctly clear the flag.
+  function onDragLeave(e: DragEvent) {
+    e.preventDefault();
+    if (contentEl && e.relatedTarget instanceof Node && contentEl.contains(e.relatedTarget)) return;
+    isDragging = false;
+  }
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    isDragging = false;
+    if (e.dataTransfer?.files) handleFiles(e.dataTransfer.files);
+  }
+
+  function resolveOverwrite() {
+    const conflict = conflictQueue[0];
+    if (!conflict) return;
+    transfers.enqueue(conflict.file, conflict.key);
+    conflictQueue = conflictQueue.slice(1);
+  }
+  function resolveSaveAsCopy(newName: string) {
+    const conflict = conflictQueue[0];
+    if (!conflict) return;
+    transfers.enqueue(conflict.file, conflict.prefix + newName);
+    conflictQueue = conflictQueue.slice(1);
+  }
+  function resolveCancel() {
+    conflictQueue = conflictQueue.slice(1);
+  }
 
   const listing = $derived(childEntries(session.manifest?.objects ?? [], browse.prefix));
   const footer = $derived.by(() => {
@@ -90,7 +183,14 @@
     <Sidebar />
     <main>
       <div class="toolbar">
-        <button class="upload" disabled title="Uploads arrive in a later phase">＋ Upload</button>
+        <input
+          type="file"
+          multiple
+          class="sr-only"
+          bind:this={fileInput}
+          onchange={onFileInputChange}
+        />
+        <button class="upload" onclick={() => fileInput?.click()}>＋ Upload</button>
         {#if browse.section === "all"}
           <Breadcrumbs />
         {:else}
@@ -109,7 +209,18 @@
           <button aria-label="Dismiss" onclick={() => (session.refreshError = null)}>✕</button>
         </div>
       {/if}
-      <div class="content">
+      <!-- svelte-ignore a11y_no_static_element_interactions -- drag-drop is a
+           mouse-only convenience layered over the same conflict pipeline as
+           the Upload button, which remains the fully keyboard/AT-accessible
+           path -->
+      <div
+        class="content"
+        bind:this={contentEl}
+        ondragenter={onDragEnter}
+        ondragover={onDragOver}
+        ondragleave={onDragLeave}
+        ondrop={onDrop}
+      >
         {#if browse.section === "all"}
           {#if browse.view === "list"}
             <FileList {listing} />
@@ -126,6 +237,9 @@
             <p class="empty">{sectionEmptyMessage}</p>
           {/if}
         {/if}
+        {#if isDragging}
+          <div class="drop-overlay">Drop to upload to {folderLabel(browse.prefix)}</div>
+        {/if}
       </div>
       {#if browse.section === "all"}
         <div class="footer">{footer}</div>
@@ -133,6 +247,25 @@
     </main>
   </div>
 </div>
+
+<TransferPanel />
+
+{#if currentConflict}
+  {#key currentConflict.id}
+    <ConflictModal
+      file={currentConflict.file}
+      targetKey={currentConflict.key}
+      takenNames={takenNamesInPrefix(
+        session.manifest?.objects ?? [],
+        inFlightKeys,
+        currentConflict.prefix,
+      )}
+      onOverwrite={resolveOverwrite}
+      onSaveAsCopy={resolveSaveAsCopy}
+      onCancel={resolveCancel}
+    />
+  {/key}
+{/if}
 
 <style>
   .screen {
@@ -166,10 +299,6 @@
     padding: 7px 14px;
     font-weight: 700;
   }
-  .upload:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
   .spacer {
     flex: 1;
   }
@@ -193,8 +322,22 @@
     padding: 5px 10px;
   }
   .content {
+    position: relative;
     flex: 1;
     overflow-y: auto;
+  }
+  .drop-overlay {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: var(--accent-soft);
+    border: 2px dashed var(--accent);
+    border-radius: var(--radius);
+    color: var(--accent-text);
+    font-weight: 600;
+    pointer-events: none;
+    z-index: 10;
   }
   .empty {
     color: var(--text-dim);

@@ -352,6 +352,60 @@ async fn abort_multipart_upload_deletes_with_upload_id() {
 }
 
 #[tokio::test]
+async fn head_object_returns_etag_and_size() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/test-bucket/photo.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"abc123\"")
+                .insert_header("content-length", "4096"),
+        )
+        .mount(&server)
+        .await;
+
+    let result = client_for(&server)
+        .head_object("photo.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.etag, "\"abc123\"");
+    assert_eq!(result.size, 4096);
+}
+
+#[tokio::test]
+async fn head_object_returns_none_on_404() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/test-bucket/missing.jpg"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let result = client_for(&server)
+        .head_object("missing.jpg")
+        .await
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn head_object_missing_content_length_is_invalid_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/test-bucket/no-length.jpg"))
+        .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"abc123\""))
+        .mount(&server)
+        .await;
+
+    let err = client_for(&server)
+        .head_object("no-length.jpg")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, S3Error::InvalidResponse(_)));
+}
+
+#[tokio::test]
 async fn list_multipart_uploads_hits_bucket_root_with_uploads_query() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

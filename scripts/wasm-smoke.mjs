@@ -72,4 +72,61 @@ try {
 if (!threw) throw new Error("unknown key must throw");
 console.log("favorite roundtrip: ok");
 
+// Upload planning: single-PUT vs multipart math.
+const singlePlan = client.upload_plan(1000);
+if (singlePlan.kind !== "single") throw new Error(`expected single plan, got ${JSON.stringify(singlePlan)}`);
+const multipartPlan = client.upload_plan(200 * 1024 * 1024);
+if (multipartPlan.kind !== "multipart" || multipartPlan.part_size !== 64 * 1024 * 1024 || multipartPlan.part_count !== 4) {
+  throw new Error(`unexpected multipart plan: ${JSON.stringify(multipartPlan)}`);
+}
+console.log("upload_plan: ok");
+
+// Single-PUT upload roundtrip: presign, PUT via Node fetch, HEAD, then
+// record it in the manifest. Overwrites the same key each run rather than
+// cleaning up afterward — there is no wasm delete method yet, and this is
+// the seeded local/CI bucket, so a stray row is acceptable.
+const uploadKey = "smoke/upload-roundtrip.txt";
+const uploadBody = `hello from wasm smoke @ ${Date.now()}`;
+const presigned = client.presign_put(uploadKey, 60);
+if (presigned.method !== "PUT" || !presigned.url.startsWith("http")) {
+  throw new Error(`bad presigned request: ${JSON.stringify(presigned)}`);
+}
+const putResponse = await fetch(presigned.url, {
+  method: "PUT",
+  body: uploadBody,
+  headers: { "content-type": "text/plain" },
+});
+if (!putResponse.ok) throw new Error(`presigned PUT failed: ${putResponse.status}`);
+const putEtag = putResponse.headers.get("etag");
+if (!putEtag) throw new Error("presigned PUT response missing ETag header");
+console.log("presign_put + fetch PUT: ok");
+
+const headed = await client.head_object(uploadKey);
+if (headed === null) throw new Error("head_object returned null for an object that was just uploaded");
+if (headed.etag !== putEtag) throw new Error(`head_object etag ${headed.etag} !== PUT etag ${putEtag}`);
+if (headed.size !== uploadBody.length) throw new Error(`head_object size ${headed.size} !== ${uploadBody.length}`);
+console.log("head_object roundtrip: ok");
+
+const missingHead = await client.head_object("smoke/definitely-does-not-exist.txt");
+if (missingHead !== null) throw new Error("head_object on a missing key must return null");
+console.log("head_object missing: ok");
+
+await client.upsert_object(uploadKey, headed.size, headed.etag, "text/plain");
+const afterUpsert = await client.load_manifest();
+const upsertedRow = afterUpsert.objects.find((o) => o.key === uploadKey);
+if (!upsertedRow) throw new Error("upsert_object did not add a manifest row");
+if (upsertedRow.content_type !== "text/plain") throw new Error(`unexpected content_type: ${upsertedRow.content_type}`);
+if (upsertedRow.favorite !== false) throw new Error("favorite should default to false for a new row");
+if (upsertedRow.thumbnail_key !== null) throw new Error("thumbnail_key should be null for a new row");
+console.log("upsert_object: ok");
+
+// Re-upsert with a DIFFERENT etag simulates a content change: thumbnail_key
+// must be cleared (it was already null here, but this exercises the branch
+// deliberately rather than by accident).
+await client.upsert_object(uploadKey, headed.size, `${headed.etag}-different`, "text/plain");
+const afterReupsert = await client.load_manifest();
+const reupsertedRow = afterReupsert.objects.find((o) => o.key === uploadKey);
+if (reupsertedRow.thumbnail_key !== null) throw new Error("thumbnail_key must be cleared when etag changes");
+console.log("upsert_object etag-change clears thumbnail_key: ok");
+
 console.log("SMOKE OK");
