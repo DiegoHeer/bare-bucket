@@ -1,33 +1,72 @@
 <script lang="ts">
+  import type { ManifestObject } from "../lib/core";
   import type { Listing } from "../lib/listing";
-  import { formatModified, formatSize } from "../lib/listing";
+  import { displayName, formatModified, formatSize } from "../lib/listing";
   import { iconFor } from "../lib/icons";
   import { browse } from "../lib/browse.svelte";
+  import { session } from "../lib/session.svelte";
 
-  let { listing }: { listing: Listing } = $props();
+  // Two shapes: the default folder+file listing scoped to `browse.prefix`,
+  // or a flat files-only mode (Recent/Favorites/Search) that shows each
+  // file's parent path instead of relying on the current prefix.
+  type Props = { listing: Listing; showPath?: false } | { files: ManifestObject[]; showPath: true };
+
+  let props: Props = $props();
+
+  const folders = $derived("listing" in props ? props.listing.folders : []);
+  const files = $derived("listing" in props ? props.listing.files : props.files);
+  const showPath = $derived("showPath" in props && props.showPath === true);
 
   function fileName(key: string): string {
-    return key.slice(browse.prefix.length);
+    return showPath ? displayName(key).name : key.slice(browse.prefix.length);
+  }
+
+  function parentPath(key: string): string {
+    return displayName(key).parent;
   }
 </script>
 
 <table>
   <thead>
-    <tr><th class="name">Name</th><th class="num">Size</th><th class="num">Modified</th></tr>
+    <tr><th class="name">Name</th><th class="num">Size</th><th class="num">Modified</th><th class="star-col"><span class="sr-only">Favorite</span></th></tr>
   </thead>
   <tbody>
-    {#each listing.folders as folder (folder.prefix)}
+    {#each folders as folder (folder.prefix)}
       <tr class="clickable" onclick={() => browse.navigate(folder.prefix)}>
         <td class="name">📁 {folder.name}</td>
         <td class="num">—</td>
         <td class="num"></td>
+        <td class="star-col"></td>
       </tr>
     {/each}
-    {#each listing.files as file (file.key)}
+    {#each files as file (file.key)}
       <tr>
-        <td class="name">{iconFor(file.content_type)} {fileName(file.key)}</td>
+        <td class="name">
+          {iconFor(file.content_type)} {fileName(file.key)}
+          {#if showPath && parentPath(file.key)}
+            <button
+              class="path"
+              onclick={(e) => {
+                e.stopPropagation();
+                browse.navigate(parentPath(file.key) + "/");
+              }}
+            >{parentPath(file.key)}</button>
+          {/if}
+        </td>
         <td class="num">{formatSize(file.size)}</td>
         <td class="num">{formatModified(file.last_modified)}</td>
+        <td class="star-col">
+          <button
+            class="star"
+            class:starred={file.favorite}
+            title={file.favorite ? "Unstar" : "Star"}
+            aria-pressed={file.favorite}
+            onclick={(e) => {
+              e.stopPropagation();
+              void session.toggleFavorite(file.key);
+            }}
+          >{file.favorite ? "★" : "☆"}</button>
+        </td>
       </tr>
     {/each}
   </tbody>
@@ -62,6 +101,40 @@
   }
   td.name {
     overflow-wrap: anywhere;
+  }
+  .path {
+    display: block;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: none;
+    border: none;
+    padding: 0;
+    text-align: left;
+    cursor: pointer;
+  }
+  .path:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  th.star-col,
+  td.star-col {
+    width: 30px;
+    padding: 8px 6px;
+  }
+  .star {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px;
+  }
+  .star.starred {
+    color: var(--star);
+  }
+  .star:hover {
+    color: var(--star);
   }
   tr.clickable {
     cursor: pointer;

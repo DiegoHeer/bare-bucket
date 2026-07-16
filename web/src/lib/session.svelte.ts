@@ -16,9 +16,14 @@ interface Session {
   refresh(): Promise<void>;
   disconnect(): void;
   clearError(): void;
+  toggleFavorite(key: string): Promise<void>;
 }
 
 const DEVICE_ID_KEY = "bare-bucket/device-id";
+
+/** Keys with an in-flight `set_favorite` call — guards against a rapid
+ * double-toggle producing order-dependent state on failure. */
+const favoriteInflight = new Set<string>();
 
 /** A stable per-browser device id (spec §4.1 last-writer tracking) —
  * generated once and cached in localStorage. Falls back to a fresh,
@@ -60,6 +65,7 @@ export const session: Session = $state({
     if (session.connecting) return;
     session.connecting = true;
     session.error = null;
+    session.refreshError = null;
     let client: WasmClient | undefined;
     try {
       client = createClient({
@@ -128,5 +134,35 @@ export const session: Session = $state({
 
   clearError() {
     session.error = null;
+  },
+
+  /** Optimistic favorite toggle (spec §... ) — flips the local flag
+   * immediately for a snappy UI, then persists across the wasm boundary;
+   * reverts and surfaces `refreshError` on failure. */
+  async toggleFavorite(key: string) {
+    if (!session.client || !session.manifest) return;
+    if (favoriteInflight.has(key)) return;
+    const object = session.manifest.objects.find((o) => o.key === key);
+    if (!object) return;
+    const next = !object.favorite;
+    object.favorite = next; // optimistic
+    favoriteInflight.add(key);
+    try {
+      await session.client.set_favorite(key, next);
+      // Re-assert on the live instance — an overlapping refresh() may have
+      // replaced `session.manifest` with pre-write data between the
+      // optimistic flip and this write completing.
+      const found = session.manifest?.objects.find((o) => o.key === key);
+      if (found) found.favorite = next;
+    } catch (e) {
+      // Revert on the live instance — a concurrent refresh() may have
+      // replaced `session.manifest.objects` with a new array, detaching
+      // the captured `object` reference.
+      const found = session.manifest?.objects.find((o) => o.key === key);
+      if (found) found.favorite = !next;
+      session.refreshError = describeError(e);
+    } finally {
+      favoriteInflight.delete(key);
+    }
   },
 });

@@ -4,8 +4,12 @@ import {
   breadcrumbSegments,
   buildTree,
   childEntries,
+  displayName,
+  favoriteFiles,
   formatModified,
   formatSize,
+  recentFiles,
+  searchFiles,
   totalSize,
 } from "../src/lib/listing";
 
@@ -137,5 +141,64 @@ describe("totalSize", () => {
   it("sums live objects only", () => {
     const withDeleted = [...objects, obj("gone.txt", { size: 999999, deleted_at: "x" })];
     expect(totalSize(withDeleted)).toBe(objects.length * 100);
+  });
+});
+
+describe("recentFiles", () => {
+  it("sorts live files newest first with key tiebreak", () => {
+    const list = [
+      obj("b.txt", { last_modified: "2026-07-10T00:00:00Z" }),
+      obj("a.txt", { last_modified: "2026-07-14T00:00:00Z" }),
+      obj("tie-b.txt", { last_modified: "2026-07-12T00:00:00Z" }),
+      obj("tie-a.txt", { last_modified: "2026-07-12T00:00:00Z" }),
+      obj("dead.txt", { last_modified: "2026-07-15T00:00:00Z", deleted_at: "x" }),
+    ];
+    expect(recentFiles(list).map((f) => f.key)).toEqual([
+      "a.txt",
+      "tie-a.txt",
+      "tie-b.txt",
+      "b.txt",
+    ]);
+  });
+});
+
+describe("favoriteFiles", () => {
+  it("returns only live favorites, name-sorted", () => {
+    const list = [
+      obj("z.txt", { favorite: true }),
+      obj("a.txt", { favorite: true }),
+      obj("m.txt"),
+      obj("dead.txt", { favorite: true, deleted_at: "x" }),
+    ];
+    expect(favoriteFiles(list).map((f) => f.key)).toEqual(["a.txt", "z.txt"]);
+  });
+});
+
+describe("searchFiles", () => {
+  const list = [
+    obj("photos/2026/trip/IMG_0142.jpg"),
+    obj("docs/Itinerary.pdf"),
+    obj("dead-img.txt", { deleted_at: "x" }),
+  ];
+  it("matches case-insensitively across the full key", () => {
+    expect(searchFiles(list, "img").map((f) => f.key)).toEqual([
+      "photos/2026/trip/IMG_0142.jpg",
+    ]);
+    expect(searchFiles(list, "ITINER").map((f) => f.key)).toEqual(["docs/Itinerary.pdf"]);
+    expect(searchFiles(list, "2026/trip")).toHaveLength(1);
+  });
+  it("returns nothing for empty or whitespace queries", () => {
+    expect(searchFiles(list, "")).toEqual([]);
+    expect(searchFiles(list, "   ")).toEqual([]);
+  });
+});
+
+describe("displayName", () => {
+  it("splits name and parent", () => {
+    expect(displayName("photos/2026/trip/IMG.jpg")).toEqual({
+      name: "IMG.jpg",
+      parent: "photos/2026/trip",
+    });
+    expect(displayName("readme.md")).toEqual({ name: "readme.md", parent: "" });
   });
 });

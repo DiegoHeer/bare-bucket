@@ -112,6 +112,27 @@ impl WasmClient {
         let loaded = store.load().await.map_err(js_error)?;
         to_js(&loaded.manifest)
     }
+
+    /// Star/unstar an object. Holds the manifest writer lock (see module
+    /// docs) for the read→mutate→conditional-PUT cycle.
+    pub async fn set_favorite(&self, key: String, favorite: bool) -> Result<(), JsError> {
+        let _write = self.inner.manifest_write_lock.lock().await;
+        let store = ManifestStore::new(&self.inner.client, &self.inner.device_id);
+        // The lock serializes all writers, so the mutator's LAST run is the one
+        // whose result got written; checking the captured flag after
+        // update_with_retry therefore reflects the persisted manifest version.
+        let mut found = false;
+        store
+            .update_with_retry(|m| {
+                found = m.set_favorite(&key, favorite);
+            })
+            .await
+            .map_err(js_error)?;
+        if !found {
+            return Err(JsError::new(&format!("unknown key: {key}")));
+        }
+        Ok(())
+    }
 }
 
 /// ReconcileReport mirror with serde derive (the core struct deliberately

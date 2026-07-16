@@ -6,7 +6,14 @@
   import FileGrid from "../components/FileGrid.svelte";
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
-  import { childEntries, formatSize, totalSize } from "../lib/listing";
+  import {
+    childEntries,
+    favoriteFiles,
+    formatSize,
+    recentFiles,
+    searchFiles,
+    totalSize,
+  } from "../lib/listing";
 
   const listing = $derived(childEntries(session.manifest?.objects ?? [], browse.prefix));
   const footer = $derived.by(() => {
@@ -17,6 +24,64 @@
     const files = listing.files.length;
     return `${folders} folder${folders === 1 ? "" : "s"}, ${files} file${files === 1 ? "" : "s"} · ${formatSize(bytes)} total`;
   });
+
+  const sectionFiles = $derived.by(() => {
+    const objects = session.manifest?.objects ?? [];
+    switch (browse.section) {
+      case "recent":
+        return recentFiles(objects);
+      case "favorites":
+        return favoriteFiles(objects);
+      case "search":
+        return searchFiles(objects, browse.searchQuery);
+      default:
+        return [];
+    }
+  });
+
+  const sectionTitle = $derived.by(() => {
+    switch (browse.section) {
+      case "recent":
+        return "Recent";
+      case "favorites":
+        return "Favorites";
+      case "search":
+        return `Search results for "${browse.searchQuery}"`;
+      default:
+        return "";
+    }
+  });
+
+  const sectionEmptyMessage = $derived.by(() => {
+    switch (browse.section) {
+      case "recent":
+        return "Nothing here yet.";
+      case "favorites":
+        return "Star files to pin them here.";
+      case "search":
+        return "No matches.";
+      default:
+        return "";
+    }
+  });
+
+  // A section switch or a stale (e.g. just-deleted) prefix can leave
+  // `browse.prefix` pointing at a folder with no children; walk up to the
+  // nearest ancestor that still exists so the "all" view never renders on a
+  // dead prefix.
+  $effect(() => {
+    if (browse.section !== "all") return;
+    const objects = session.manifest?.objects ?? [];
+    let prefix = browse.prefix;
+    while (prefix !== "") {
+      const { folders, files } = childEntries(objects, prefix);
+      if (folders.length > 0 || files.length > 0) break;
+      const next = prefix.replace(/[^/]+\/$/, "");
+      if (next === prefix) break;
+      prefix = next;
+    }
+    if (prefix !== browse.prefix) browse.prefix = prefix;
+  });
 </script>
 
 <div class="screen">
@@ -26,23 +91,45 @@
     <main>
       <div class="toolbar">
         <button class="upload" disabled title="Uploads arrive in a later phase">＋ Upload</button>
-        <Breadcrumbs />
-        <span class="spacer"></span>
-        <button class="ghost" onclick={() => browse.toggleView()} title="Toggle view">
-          {browse.view === "list" ? "▦" : "☰"}
-        </button>
-      </div>
-      <div class="content">
-        {#if browse.view === "list"}
-          <FileList {listing} />
+        {#if browse.section === "all"}
+          <Breadcrumbs />
         {:else}
-          <FileGrid {listing} />
+          <span class="section-title">{sectionTitle}</span>
         {/if}
-        {#if listing.folders.length === 0 && listing.files.length === 0}
-          <p class="empty">This folder is empty.</p>
+        <span class="spacer"></span>
+        {#if browse.section === "all"}
+          <button class="ghost" onclick={() => browse.toggleView()} title="Toggle view">
+            {browse.view === "list" ? "▦" : "☰"}
+          </button>
         {/if}
       </div>
-      <div class="footer">{footer}</div>
+      {#if session.refreshError}
+        <div class="refresh-error" role="alert">
+          {session.refreshError}
+          <button aria-label="Dismiss" onclick={() => (session.refreshError = null)}>✕</button>
+        </div>
+      {/if}
+      <div class="content">
+        {#if browse.section === "all"}
+          {#if browse.view === "list"}
+            <FileList {listing} />
+          {:else}
+            <FileGrid {listing} />
+          {/if}
+          {#if listing.folders.length === 0 && listing.files.length === 0}
+            <p class="empty">This folder is empty.</p>
+          {/if}
+        {:else}
+          <p class="section-count">{sectionFiles.length} result{sectionFiles.length === 1 ? "" : "s"}</p>
+          <FileList files={sectionFiles} showPath />
+          {#if sectionFiles.length === 0}
+            <p class="empty">{sectionEmptyMessage}</p>
+          {/if}
+        {/if}
+      </div>
+      {#if browse.section === "all"}
+        <div class="footer">{footer}</div>
+      {/if}
     </main>
   </div>
 </div>
@@ -86,6 +173,18 @@
   .spacer {
     flex: 1;
   }
+  .section-title {
+    font-weight: 600;
+    color: var(--text-bright);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .section-count {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
   .ghost {
     background: none;
     border: 1px solid var(--border-strong);
@@ -107,5 +206,23 @@
     font-size: 12px;
     border-top: 1px solid var(--border);
     padding-top: 8px;
+  }
+  .refresh-error {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--accent-soft);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-small);
+    color: var(--accent-text);
+    font-size: 12px;
+    padding: 6px 10px;
+  }
+  .refresh-error button {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
   }
 </style>

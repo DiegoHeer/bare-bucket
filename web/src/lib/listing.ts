@@ -118,3 +118,34 @@ export function formatModified(iso: string, now: Date = new Date()): string {
 export function totalSize(objects: ManifestObject[]): number {
   return live(objects).reduce((sum, o) => sum + o.size, 0);
 }
+
+export function recentFiles(objects: ManifestObject[]): ManifestObject[] {
+  return live(objects)
+    .slice()
+    .sort(
+      (a, b) =>
+        (Date.parse(b.last_modified) || 0) - (Date.parse(a.last_modified) || 0) ||
+        a.key.localeCompare(b.key),
+    );
+}
+
+export function favoriteFiles(objects: ManifestObject[]): ManifestObject[] {
+  return live(objects)
+    .filter((o) => o.favorite)
+    .sort((a, b) => byName.compare(a.key, b.key));
+}
+
+export function searchFiles(objects: ManifestObject[], query: string): ManifestObject[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+  return live(objects)
+    .filter((o) => o.key.toLowerCase().includes(needle))
+    .sort((a, b) => byName.compare(a.key, b.key));
+}
+
+export function displayName(key: string): { name: string; parent: string } {
+  const slash = key.lastIndexOf("/");
+  return slash === -1
+    ? { name: key, parent: "" }
+    : { name: key.slice(slash + 1), parent: key.slice(0, slash) };
+}

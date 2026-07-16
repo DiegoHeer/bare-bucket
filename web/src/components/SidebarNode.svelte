@@ -6,7 +6,7 @@
   let { node, depth = 0 }: { node: TreeNode; depth?: number } = $props();
   let expanded = $state(false);
 
-  const active = $derived(browse.prefix === node.prefix);
+  const active = $derived(browse.section === "all" && browse.prefix === node.prefix);
   // Auto-expand ancestors of the current prefix
   $effect(() => {
     if (browse.prefix.startsWith(node.prefix) && browse.prefix !== node.prefix) {

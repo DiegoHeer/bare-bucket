@@ -2,6 +2,7 @@
   import type { Listing } from "../lib/listing";
   import { iconFor } from "../lib/icons";
   import { browse } from "../lib/browse.svelte";
+  import { session } from "../lib/session.svelte";
 
   let { listing }: { listing: Listing } = $props();
 
@@ -19,6 +20,16 @@
   {/each}
   {#each listing.files as file (file.key)}
     <div class="tile">
+      <button
+        class="star"
+        class:starred={file.favorite}
+        title={file.favorite ? "Unstar" : "Star"}
+        aria-pressed={file.favorite}
+        onclick={(e) => {
+          e.stopPropagation();
+          void session.toggleFavorite(file.key);
+        }}
+      >{file.favorite ? "★" : "☆"}</button>
       <span class="thumb">{iconFor(file.content_type)}</span>
       <span class="caption">{fileName(file.key)}</span>
     </div>
@@ -32,6 +43,7 @@
     gap: 10px;
   }
   .tile {
+    position: relative;
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -41,6 +53,25 @@
     text-align: center;
     color: inherit;
     font: inherit;
+  }
+  .star {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px;
+    z-index: 1;
+  }
+  .star.starred {
+    color: var(--star);
+  }
+  .star:hover {
+    color: var(--star);
   }
   button.tile {
     cursor: pointer;
