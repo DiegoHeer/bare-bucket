@@ -33,10 +33,8 @@ npm run build                        # production build -> web/dist/
 wasm binary. There's nothing else to build or deploy.
 
 > If you're iterating locally rather than deploying, `npm run dev` runs a
-> Vite dev server, but it currently 404s on the wasm asset in some setups
-> (a Vite dev-server / local `file:` package interaction, tracked as a known
-> issue — see below). Until that's fixed, prefer `npm run build && npm run
-> preview` for a local check that exercises the real build output.
+> Vite dev server. For a check that exercises the real build output, use
+> `npm run build && npm run preview` instead.
 
 ## Serving
 
@@ -96,8 +94,9 @@ S3-CORS template:
   the text-preview lightbox issues against a presigned URL, spec §7.5).
 - **`ExposeHeaders`**: `ETag` (read back after every PUT/GET/HEAD — required
   for multipart part assembly and object-conflict comparison), `Content-Range`
-  and `Accept-Ranges` (read back from the ranged preview `GET` to determine
-  the object's real size vs. a stale manifest value).
+  (read back from the ranged preview `GET` to determine the object's real
+  size vs. a stale manifest value), and `Accept-Ranges` (consumed by pdf.js's
+  range-probing when streaming PDF previews).
 - **`AllowedMethods`**: `GET`, `PUT`, `POST`, `DELETE`, `HEAD`.
 - **`AllowedOrigins`**: the origin(s) you serve `web/dist/` from, e.g.
   `https://bucket.example.com` or `http://192.168.1.50:8080` for a plain LAN
@@ -245,10 +244,11 @@ provider's clock produces `SignatureDoesNotMatch`/403 even with correct
 keys. Check the browsing device's clock (NTP sync) if you're otherwise
 confident the access key/secret/endpoint/region are right.
 
-**`npm run dev` 404s on the wasm asset**: a known interaction between Vite's
-dev server and the local `file:` wasm package (`core/pkg`) — tracked
-separately, not yet fixed. Until it is, use `npm run build && npm run
-preview` for local testing; the production build path is unaffected.
+**`npm run dev` 404s on the wasm asset**: fixed via `server.fs.allow` in
+`web/vite.config.ts` (Vite's file-serving allow-list stopped at
+`web/`, blocking the local `file:` wasm package in `core/pkg`). If you see
+this on an older checkout, update; the production build path was never
+affected.
 
 ## See also
 

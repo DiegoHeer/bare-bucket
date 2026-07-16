@@ -96,8 +96,5 @@ npm run build                        # production build (web/dist/)
 npm run preview                      # serve the production build locally
 ```
 
-> `npm run dev` currently 404s on the wasm asset in some setups (a Vite
-> dev-server / local `file:` package interaction — known issue, not yet
-> fixed). If you hit that, use `npm run build && npm run preview` instead;
-> the production build path is unaffected. See `docs/self-hosting.md` for
-> build/serve/CORS details when deploying somewhere other than your laptop.
+> See `docs/self-hosting.md` for build/serve/CORS details when deploying
+> somewhere other than your laptop.
