@@ -66,6 +66,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 26
+      - run: |
+          printf 'ci-seed' > /tmp/seed.txt
+          docker compose run --rm -v /tmp/seed.txt:/seed.txt:z --entrypoint sh createbucket -c "mc alias set local http://minio:9000 baretest baretest123 && mc cp /seed.txt local/bare-bucket-it/ci-seed/seed.txt"
       - run: node scripts/wasm-smoke.mjs
 
   web:
