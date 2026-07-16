@@ -32,6 +32,10 @@ fn client() -> Option<S3Client> {
     )
 }
 
+// The whole live suite runs serially: tests share one bucket and one
+// manifest object, and reconcile() LISTs the entire bucket — concurrent
+// tests' transient objects would corrupt its counters.
+#[serial_test::serial]
 #[tokio::test]
 async fn full_object_lifecycle() {
     let Some(client) = client() else { return };
@@ -85,6 +89,7 @@ async fn full_object_lifecycle() {
     assert!(matches!(err, S3Error::NotFound { .. }));
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn list_paginates_across_pages() {
     let Some(client) = client() else { return };
@@ -131,6 +136,7 @@ async fn list_paginates_across_pages() {
     }
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn multipart_roundtrip_via_presigned_descriptors() {
     let Some(client) = client() else { return };
@@ -220,6 +226,7 @@ async fn multipart_roundtrip_via_presigned_descriptors() {
     client.delete_object(&key).await.expect("cleanup");
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn manifest_conflict_loop_preserves_concurrent_changes() {
     use bare_bucket_core::manifest::{ManifestObject, ManifestStore, MANIFEST_KEY};
@@ -287,4 +294,82 @@ async fn manifest_conflict_loop_preserves_concurrent_changes() {
     assert_eq!(merged.manifest.last_writer_device_id, "device-b");
 
     client.delete_object(MANIFEST_KEY).await.expect("cleanup");
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn reconcile_heals_out_of_band_changes() {
+    use bare_bucket_core::manifest::{thumbnail_key_for, ManifestStore, MANIFEST_KEY};
+    use bare_bucket_core::reconcile::{reconcile, ReconcileOptions};
+
+    let Some(client) = client() else { return };
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let prefix = format!("it/{run}/reconcile/");
+    let _ = client.delete_object(MANIFEST_KEY).await;
+
+    // Out-of-band state: two data objects, one live thumb, one orphan thumb,
+    // one dangling multipart upload (old enough via min_upload_age_secs: 0).
+    let key_a = format!("{prefix}a.txt");
+    let key_b = format!("{prefix}b.jpg");
+    client
+        .put_object(&key_a, b"aaa", "text/plain", None)
+        .await
+        .expect("seed a");
+    client
+        .put_object(&key_b, b"bbb", "image/jpeg", None)
+        .await
+        .expect("seed b");
+    let live_thumb = thumbnail_key_for(&key_b);
+    let orphan_thumb = thumbnail_key_for(&format!("{prefix}vanished.jpg"));
+    client
+        .put_object(&live_thumb, b"t", "image/webp", None)
+        .await
+        .expect("live thumb");
+    client
+        .put_object(&orphan_thumb, b"t", "image/webp", None)
+        .await
+        .expect("orphan thumb");
+    let dangling = client
+        .create_multipart_upload(&format!("{prefix}dangling.bin"), "application/octet-stream")
+        .await
+        .expect("dangling upload");
+
+    let report = reconcile(
+        &client,
+        "device-it",
+        &ReconcileOptions {
+            active_upload_ids: &[],
+            min_upload_age_secs: 0,
+        },
+    )
+    .await
+    .expect("reconcile");
+
+    assert_eq!(report.added, 2, "both data objects discovered");
+    assert_eq!(report.thumbnails_deleted, 1, "orphan thumb removed");
+    assert!(report.uploads_aborted >= 1, "dangling upload aborted");
+
+    // Manifest reflects the bucket; live thumb key was NOT attached (no row
+    // had it) but the thumb object survives for PR 14 to pick up.
+    let store = ManifestStore::new(&client, "device-it");
+    let loaded = store.load().await.expect("load");
+    assert_eq!(loaded.manifest.live_objects().count(), 2);
+    assert!(loaded.manifest.get(&key_a).is_some());
+    assert!(loaded.manifest.last_full_rebuild_at.is_some());
+
+    // The dangling upload is really gone.
+    let uploads = client.list_multipart_uploads().await.expect("uploads");
+    assert!(!uploads.iter().any(|u| u.upload_id == dangling));
+
+    // Cleanup.
+    for key in [key_a.as_str(), key_b.as_str(), live_thumb.as_str()] {
+        client.delete_object(key).await.expect("cleanup");
+    }
+    client
+        .delete_object(MANIFEST_KEY)
+        .await
+        .expect("cleanup manifest");
 }
