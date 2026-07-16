@@ -159,13 +159,23 @@ impl Manifest {
         }
     }
 
+    /// Set or clear a live row's `thumbnail_key` (spec §9, PR 14 [B2]).
+    ///
+    /// Found-flag pattern (like [`Self::mark_deleted`], NOT `set_favorite`'s
+    /// write-on-miss shape): an absent key, a tombstoned row (tombstoned =
+    /// absent per the PR 10 rule), or setting an identical value are all
+    /// no-ops that return `false`, so a caller driving
+    /// [`ManifestStore::update_with_retry_if_changed`] can skip a pointless
+    /// PUT.
     pub fn set_thumbnail(&mut self, key: &str, thumbnail_key: Option<String>) -> bool {
         match self.get_mut(key) {
-            Some(object) => {
+            Some(object)
+                if object.deleted_at.is_none() && object.thumbnail_key != thumbnail_key =>
+            {
                 object.thumbnail_key = thumbnail_key;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -518,6 +528,57 @@ mod tests {
             Some(".bare-bucket/thumbs/a.txt.webp")
         );
         assert!(!manifest.set_favorite("missing.txt", true));
+    }
+
+    #[test]
+    fn set_thumbnail_clears_via_none() {
+        let mut manifest = Manifest::empty();
+        let mut with_thumb = object("a.txt");
+        with_thumb.thumbnail_key = Some(".bare-bucket/thumbs/a.txt.webp".to_string());
+        manifest.upsert(with_thumb);
+
+        assert!(manifest.set_thumbnail("a.txt", None));
+        assert!(manifest.get("a.txt").unwrap().thumbnail_key.is_none());
+    }
+
+    #[test]
+    fn set_thumbnail_identical_value_is_a_noop() {
+        let mut manifest = Manifest::empty();
+        let mut with_thumb = object("a.txt");
+        with_thumb.thumbnail_key = Some(".bare-bucket/thumbs/a.txt.webp".to_string());
+        manifest.upsert(with_thumb);
+
+        // Same value as already stored: found-flag pattern reports no change.
+        assert!(
+            !manifest.set_thumbnail("a.txt", Some(".bare-bucket/thumbs/a.txt.webp".to_string()))
+        );
+        // Setting None-to-None is likewise a no-op.
+        manifest.upsert(object("b.txt"));
+        assert!(!manifest.set_thumbnail("b.txt", None));
+    }
+
+    #[test]
+    fn set_thumbnail_on_absent_key_reports_no_change() {
+        let mut manifest = Manifest::empty();
+        manifest.upsert(object("a.txt"));
+        assert!(!manifest.set_thumbnail(
+            "missing.txt",
+            Some(".bare-bucket/thumbs/missing.txt.webp".to_string())
+        ));
+        assert!(manifest.get("missing.txt").is_none());
+    }
+
+    #[test]
+    fn set_thumbnail_on_tombstoned_row_reports_no_change() {
+        let mut manifest = Manifest::empty();
+        manifest.upsert(object("a.txt"));
+        assert!(manifest.mark_deleted("a.txt", "2026-07-15T12:00:00Z"));
+        // Tombstoned = absent (PR 10 rule): setting a thumbnail on a deleted
+        // row must not resurrect or otherwise touch it.
+        assert!(
+            !manifest.set_thumbnail("a.txt", Some(".bare-bucket/thumbs/a.txt.webp".to_string()))
+        );
+        assert!(manifest.get("a.txt").unwrap().thumbnail_key.is_none());
     }
 
     #[test]

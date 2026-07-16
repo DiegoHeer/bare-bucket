@@ -7,7 +7,7 @@
 // wasm client or network, with deterministic promise resolution standing in
 // for real async I/O timing.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { engineDeps, keysInStatus, transfers, type Transfer } from "../src/lib/transfers.svelte";
+import { engineDeps, keysInStatus, shouldGenerateThumb, transfers, type Transfer } from "../src/lib/transfers.svelte";
 import { session } from "../src/lib/session.svelte";
 import type { PresignedRequest, WasmClient } from "../src/lib/core";
 
@@ -177,6 +177,7 @@ const realPutWithProgress = engineDeps.putWithProgress;
 const realGetClient = engineDeps.getClient;
 const realPresignGet = engineDeps.presignGet;
 const realFetchStream = engineDeps.fetchStream;
+const realGenerateAndUploadThumb = engineDeps.generateAndUploadThumb;
 
 describe("transfers engine", () => {
   beforeEach(() => {
@@ -189,6 +190,7 @@ describe("transfers engine", () => {
     engineDeps.getClient = realGetClient;
     engineDeps.presignGet = realPresignGet;
     engineDeps.fetchStream = realFetchStream;
+    engineDeps.generateAndUploadThumb = realGenerateAndUploadThumb;
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
@@ -518,6 +520,134 @@ describe("transfers engine", () => {
     expect(transfers.items.filter((t) => t.direction === "upload" && t.status === "done")).toHaveLength(1);
     expect(download.status).toBe("downloading");
     expect(presignGetMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// PR 14 [B5]: the on-upload thumbnail hook. `engineDeps.generateAndUploadThumb`
+// is the seam for the heavy pipeline (canvas/pdf.js) — these tests only
+// assert whether/when finalize() calls it and that its outcome never leaks
+// into the transfer row, never the pipeline's own internals (see
+// thumbs.test.ts for that).
+describe("shouldGenerateThumb", () => {
+  it("is true for an image content-type on a non-reserved key", () => {
+    expect(shouldGenerateThumb("photos/cat.png", "image/png")).toBe(true);
+  });
+
+  it("is true for a PDF content-type on a non-reserved key", () => {
+    expect(shouldGenerateThumb("docs/report.pdf", "application/pdf")).toBe(true);
+  });
+
+  it("is false for a non-previewable content-type", () => {
+    expect(shouldGenerateThumb("clip.mp4", "video/mp4")).toBe(false);
+  });
+
+  it("is false for a key under the reserved prefix, even if it looks like an image", () => {
+    expect(shouldGenerateThumb(".bare-bucket/thumbs/cat.png.webp", "image/webp")).toBe(false);
+  });
+});
+
+describe("on-upload thumbnail hook (finalize -> engineDeps.generateAndUploadThumb)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    transfers.items = [];
+    engineDeps.putWithProgress = realPutWithProgress;
+    engineDeps.getClient = realGetClient;
+    engineDeps.generateAndUploadThumb = realGenerateAndUploadThumb;
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  function fakeSingleUploadClient(): {
+    upload_plan: ReturnType<typeof vi.fn>;
+    presign_put: ReturnType<typeof vi.fn>;
+    upsert_object: ReturnType<typeof vi.fn>;
+  } {
+    return {
+      upload_plan: vi.fn(() => ({ kind: "single" })),
+      presign_put: vi.fn(() => presigned("https://example.test/put")),
+      upsert_object: vi.fn(async () => undefined),
+    };
+  }
+
+  it("fires with (client, key, contentType, file) once an image upload finishes, without blocking 'done'", async () => {
+    const put = fakePutWithProgress();
+    engineDeps.putWithProgress = put.fn;
+    const client = fakeSingleUploadClient();
+    engineDeps.getClient = () => client as unknown as WasmClient;
+    const thumbMock = vi.fn(async () => undefined);
+    engineDeps.generateAndUploadThumb = thumbMock;
+
+    const file = new File(["fake-png-bytes"], "cat.png", { type: "image/png" });
+    transfers.enqueue(file, "cat.png");
+    await flush();
+    put.calls[0].deferred.resolve('"etag"');
+    await flush();
+
+    const transfer = transfers.items[0];
+    expect(transfer.status).toBe("done"); // settles regardless of the (still in-flight-until-flush) thumb hook
+    expect(thumbMock).toHaveBeenCalledTimes(1);
+    expect(thumbMock).toHaveBeenCalledWith(client, "cat.png", "image/png", file);
+  });
+
+  it("a rejection from the thumbnail hook is swallowed (console.warn) and never touches the transfer row", async () => {
+    const put = fakePutWithProgress();
+    engineDeps.putWithProgress = put.fn;
+    const client = fakeSingleUploadClient();
+    engineDeps.getClient = () => client as unknown as WasmClient;
+    engineDeps.generateAndUploadThumb = vi.fn(async () => {
+      throw new Error("thumb pipeline blew up");
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const file = new File(["fake-png-bytes"], "cat.png", { type: "image/png" });
+    transfers.enqueue(file, "cat.png");
+    await flush();
+    put.calls[0].deferred.resolve('"etag"');
+    await flush();
+
+    const transfer = transfers.items[0];
+    expect(transfer.status).toBe("done");
+    expect(transfer.error).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("is not fired for a non-previewable upload (e.g. video)", async () => {
+    const put = fakePutWithProgress();
+    engineDeps.putWithProgress = put.fn;
+    const client = fakeSingleUploadClient();
+    engineDeps.getClient = () => client as unknown as WasmClient;
+    const thumbMock = vi.fn(async () => undefined);
+    engineDeps.generateAndUploadThumb = thumbMock;
+
+    const file = new File(["fake-mp4-bytes"], "clip.mp4", { type: "video/mp4" });
+    transfers.enqueue(file, "clip.mp4");
+    await flush();
+    put.calls[0].deferred.resolve('"etag"');
+    await flush();
+
+    expect(transfers.items[0].status).toBe("done");
+    expect(thumbMock).not.toHaveBeenCalled();
+  });
+
+  it("is not fired for a key under the reserved prefix", async () => {
+    const put = fakePutWithProgress();
+    engineDeps.putWithProgress = put.fn;
+    const client = fakeSingleUploadClient();
+    engineDeps.getClient = () => client as unknown as WasmClient;
+    const thumbMock = vi.fn(async () => undefined);
+    engineDeps.generateAndUploadThumb = thumbMock;
+
+    const file = new File(["fake-png-bytes"], "cat.png", { type: "image/png" });
+    transfers.enqueue(file, ".bare-bucket/thumbs/cat.png.webp");
+    await flush();
+    put.calls[0].deferred.resolve('"etag"');
+    await flush();
+
+    expect(transfers.items[0].status).toBe("done");
+    expect(thumbMock).not.toHaveBeenCalled();
   });
 });
 

@@ -115,6 +115,67 @@ describe("applyTombstone", () => {
   });
 });
 
+describe("applyThumbnail", () => {
+  it("sets thumbnail_key on the live row", () => {
+    session.manifest = {
+      schema_version: 1,
+      last_full_rebuild_at: null,
+      last_writer_device_id: "web-1",
+      objects: [obj("photo.jpg")],
+    };
+
+    session.applyThumbnail("photo.jpg", ".bare-bucket/thumbs/photo.jpg.webp");
+
+    expect(session.manifest.objects[0].thumbnail_key).toBe(".bare-bucket/thumbs/photo.jpg.webp");
+  });
+
+  it("re-finds the row off the CURRENT session.manifest.objects (live-instance discipline)", () => {
+    session.manifest = {
+      schema_version: 1,
+      last_full_rebuild_at: null,
+      last_writer_device_id: "web-1",
+      objects: [obj("photo.jpg")],
+    };
+    const replaced = [obj("photo.jpg")];
+    session.manifest.objects = replaced;
+
+    session.applyThumbnail("photo.jpg", "thumbs/photo.jpg.webp");
+
+    expect(replaced[0].thumbnail_key).toBe("thumbs/photo.jpg.webp");
+  });
+
+  it("no-ops when the key is absent", () => {
+    session.manifest = {
+      schema_version: 1,
+      last_full_rebuild_at: null,
+      last_writer_device_id: "web-1",
+      objects: [obj("other.jpg")],
+    };
+
+    session.applyThumbnail("missing.jpg", "thumbs/missing.jpg.webp");
+
+    expect(session.manifest.objects[0].thumbnail_key).toBeNull();
+  });
+
+  it("no-ops on a tombstoned row rather than resurrecting it with a thumbnail_key", () => {
+    session.manifest = {
+      schema_version: 1,
+      last_full_rebuild_at: null,
+      last_writer_device_id: "web-1",
+      objects: [obj("photo.jpg", { deleted_at: "2026-07-01T00:00:00Z" })],
+    };
+
+    session.applyThumbnail("photo.jpg", "thumbs/photo.jpg.webp");
+
+    expect(session.manifest.objects[0].thumbnail_key).toBeNull();
+  });
+
+  it("no-ops when there is no manifest at all", () => {
+    session.manifest = null;
+    expect(() => session.applyThumbnail("photo.jpg", "thumbs/photo.jpg.webp")).not.toThrow();
+  });
+});
+
 describe("deleteObject", () => {
   it("rejects without calling the client when there is no connection", async () => {
     session.client = null;

@@ -2,10 +2,19 @@
   import { browse } from "../lib/browse.svelte";
   import { session } from "../lib/session.svelte";
   import { buildTree, formatSize, totalSize } from "../lib/listing";
+  import { generateMissing } from "../lib/generateMissing.svelte";
   import SidebarNode from "./SidebarNode.svelte";
 
   const objects = $derived(session.manifest?.objects ?? []);
   const tree = $derived(buildTree(objects));
+
+  /** "Generate missing thumbnails" action [B6] — a no-op while a run is
+   * already active (mirrors `generateMissing.start`'s own guard) or before
+   * a session/manifest exists. */
+  function startGenerateMissing() {
+    if (!session.client || !session.manifest) return;
+    void generateMissing.start(session.client, session.manifest);
+  }
 </script>
 
 <nav>
@@ -46,6 +55,25 @@
     {/each}
   </ul>
   <div class="storage">◔ {formatSize(totalSize(objects))} used</div>
+  <div class="thumbs-action">
+    {#if generateMissing.running}
+      <div class="thumbs-progress">
+        <span>
+          Generating thumbnails… {generateMissing.done + generateMissing.failed} / {generateMissing.total}
+        </span>
+        <button class="ghost" onclick={() => generateMissing.cancel()}>Cancel</button>
+      </div>
+    {:else}
+      <button class="ghost" onclick={startGenerateMissing}>Generate missing thumbnails</button>
+      {#if generateMissing.total > 0}
+        <span class="thumbs-summary">
+          Generated {generateMissing.done}{generateMissing.failed > 0
+            ? `, ${generateMissing.failed} failed`
+            : ""}.
+        </span>
+      {/if}
+    {/if}
+  </div>
 </nav>
 
 <style>
@@ -109,5 +137,33 @@
     color: var(--text-dim);
     border-top: 1px solid var(--border);
     padding: 10px 10px 0;
+  }
+  .thumbs-action {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 10px;
+  }
+  .ghost {
+    background: none;
+    border: 1px solid var(--border-strong);
+    color: var(--text-dim);
+    border-radius: var(--radius-small);
+    padding: 5px 10px;
+    font: inherit;
+    width: 100%;
+  }
+  .thumbs-progress {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .thumbs-progress span {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .thumbs-summary {
+    font-size: 11px;
+    color: var(--text-dim);
   }
 </style>

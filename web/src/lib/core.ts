@@ -69,6 +69,14 @@ export interface DeleteReport {
   already_absent: boolean;
 }
 
+// `WasmClient::set_thumbnail`'s report (PR 14 [B2], core/src/wasm_api.rs's
+// `SetThumbnailReport`): `updated` is `false` for the found-flag mutator's
+// no-op cases (absent key, tombstoned row, identical value) — no PUT was
+// issued and the caller must not assume the manifest changed.
+export interface SetThumbnailReport {
+  updated: boolean;
+}
+
 let initialized: Promise<void> | null = null;
 
 /** Idempotent wasm module initialization. */

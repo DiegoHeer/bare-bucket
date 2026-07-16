@@ -468,6 +468,85 @@ async fn delete_object_composite_removes_object_thumb_and_tombstones_row() {
         .expect("cleanup manifest");
 }
 
+/// Mirrors the wasm `set_thumbnail` mutator (PR 14 [B2][B3]) using core
+/// primitives directly, since this test crate has no wasm boundary: seed an
+/// object + manifest row, set the thumbnail via
+/// `ManifestStore::update_with_retry_if_changed` + `Manifest::set_thumbnail`,
+/// reload and confirm the row reflects it, then confirm a second identical
+/// call is a no-op (`updated: false` shape — no attempt/PUT happens).
+#[serial_test::serial]
+#[tokio::test]
+async fn set_thumbnail_updates_manifest_and_is_idempotent_on_repeat() {
+    use bare_bucket_core::manifest::{
+        thumbnail_key_for, ManifestObject, ManifestStore, MANIFEST_KEY,
+    };
+
+    let Some(client) = client() else { return };
+    let _ = client.delete_object(MANIFEST_KEY).await;
+
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let key = format!("it/{run}/thumbnail/photo.jpg");
+    let thumb_key = thumbnail_key_for(&key);
+
+    client
+        .put_object(&key, b"photo bytes", "image/jpeg", None)
+        .await
+        .expect("seed object");
+
+    let store = ManifestStore::new(&client, "device-it");
+    store
+        .update_with_retry(|m| {
+            m.upsert(ManifestObject {
+                key: key.clone(),
+                size: 11,
+                etag: "\"e\"".to_string(),
+                last_modified: "2026-07-15T00:00:00Z".to_string(),
+                content_type: "image/jpeg".to_string(),
+                favorite: false,
+                thumbnail_key: None,
+                deleted_at: None,
+            });
+        })
+        .await
+        .expect("seed manifest row");
+
+    // First call: absent -> Some, a real change.
+    let outcome = store
+        .update_with_retry_if_changed(|m| m.set_thumbnail(&key, Some(thumb_key.clone())))
+        .await
+        .expect("set_thumbnail write");
+    assert!(outcome.is_some(), "row had no thumbnail: a change happened");
+
+    let after = store.load().await.expect("load after set_thumbnail");
+    assert_eq!(
+        after
+            .manifest
+            .get(&key)
+            .and_then(|o| o.thumbnail_key.clone()),
+        Some(thumb_key.clone()),
+        "manifest reflects the new thumbnail_key"
+    );
+
+    // Second, identical call: no-op per the found-flag pattern [B2].
+    let outcome2 = store
+        .update_with_retry_if_changed(|m| m.set_thumbnail(&key, Some(thumb_key.clone())))
+        .await
+        .expect("second set_thumbnail attempt");
+    assert!(
+        outcome2.is_none(),
+        "identical thumbnail_key: no change, no PUT"
+    );
+
+    client.delete_object(&key).await.expect("cleanup object");
+    client
+        .delete_object(MANIFEST_KEY)
+        .await
+        .expect("cleanup manifest");
+}
+
 #[serial_test::serial]
 #[tokio::test]
 async fn reconcile_heals_out_of_band_changes() {
