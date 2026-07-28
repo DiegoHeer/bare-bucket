@@ -66,10 +66,9 @@ conventional commits on `main`: merging its release PR tags `vX.Y.Z`,
 updates `CHANGELOG.md`, and triggers `publish.yml` to build and push that
 image.
 
-> **Maintainer note:** `release-please-config.json` pins the very first
-> release to `1.0.0` via `"release-as": "1.0.0"`. Once that `v1.0.0` tag
-> has shipped, remove that line so subsequent versions are computed from
-> commits as usual.
+> **Maintainer note:** versions are computed from conventional commits by
+> release-please (`feat:` → minor, `fix:` → patch, breaking → major); merge
+> the bot's release PR to cut a release.
 
 ## Development
 

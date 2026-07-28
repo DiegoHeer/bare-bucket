@@ -5,10 +5,16 @@
       "release-type": "simple",
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": false,
-      "release-as": "1.0.0",
       "extra-files": [
-        { "type": "json", "path": "web/package.json", "jsonpath": "$.version" },
-        { "type": "generic", "path": "core/Cargo.toml" }
+        {
+          "type": "json",
+          "path": "web/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "generic",
+          "path": "core/Cargo.toml"
+        }
       ]
     }
   }
