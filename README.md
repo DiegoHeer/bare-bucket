@@ -57,6 +57,20 @@ In the app, add a profile: endpoint `http://127.0.0.1:9000`, region
 `baretest123`, path-style **on**. See `docs/self-hosting.md` for what each
 field means and how to point this at your own bucket/provider instead.
 
+No Rust/Node toolchain? Skip the build entirely and run a released image:
+`docker run -p 8080:8080 ghcr.io/diegoheer/bare-bucket-web:latest` — see
+[`docs/self-hosting.md`](docs/self-hosting.md#run-with-docker) for
+versioned tags and a Compose example. Releases are cut by
+[release-please](https://github.com/googleapis/release-please) from
+conventional commits on `main`: merging its release PR tags `vX.Y.Z`,
+updates `CHANGELOG.md`, and triggers `publish.yml` to build and push that
+image.
+
+> **Maintainer note:** `release-please-config.json` pins the very first
+> release to `1.0.0` via `"release-as": "1.0.0"`. Once that `v1.0.0` tag
+> has shipped, remove that line so subsequent versions are computed from
+> commits as usual.
+
 ## Development
 
 Requires [rustup](https://rustup.rs) and

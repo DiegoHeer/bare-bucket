@@ -136,6 +136,8 @@
         <p class="error">{session.error}</p>
       {/if}
     {/if}
+
+    <p class="app-version">v{__APP_VERSION__}</p>
   </div>
 </main>
 
@@ -313,6 +315,12 @@
   .error {
     color: var(--danger);
     font-size: 13px;
+    margin: 0;
+  }
+  .app-version {
+    color: var(--text-dim);
+    font-size: 11px;
+    text-align: center;
     margin: 0;
   }
 </style>

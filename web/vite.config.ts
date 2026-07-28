@@ -1,11 +1,15 @@
+import { readFileSync } from "node:fs";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { defineConfig } from "vite";
+
+const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf-8"));
 
 export default defineConfig({
   plugins: [svelte()],
   // The wasm pkg is a local file: dependency; keep it out of prebundling so
   // Vite serves its .wasm asset via import.meta.url resolution.
   optimizeDeps: { exclude: ["bare-bucket-core"] },
+  define: { __APP_VERSION__: JSON.stringify(pkg.version) },
   build: { target: "esnext" },
   server: {
     fs: {
