@@ -68,7 +68,10 @@ image.
 
 > **Maintainer note:** versions are computed from conventional commits by
 > release-please (`feat:` → minor, `fix:` → patch, breaking → major); merge
-> the bot's release PR to cut a release.
+> the bot's release PR to cut a release. `last-release-sha` in
+> `release-please-config.json` anchors the bot at the manually created
+> v0.1.0 re-baseline; remove that line after the first bot-cut release so
+> detection returns to automatic.
 
 ## Development
 
