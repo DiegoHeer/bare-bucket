@@ -58,7 +58,7 @@ Each release publishes a multi-arch image (amd64/arm64):
 
 ```
 ghcr.io/diegoheer/bare-bucket-web:latest     # newest release
-ghcr.io/diegoheer/bare-bucket-web:1.0.0      # exact version (recommended)
+ghcr.io/diegoheer/bare-bucket-web:0.1.0      # exact version (recommended)
 ghcr.io/diegoheer/bare-bucket-web:1.0        # newest patch of a minor
 ```
 
@@ -68,7 +68,7 @@ put your reverse proxy in front for TLS (see the http-vs-https notes below).
 ```yaml
 services:
   bare-bucket:
-    image: ghcr.io/diegoheer/bare-bucket-web:1.0.0
+    image: ghcr.io/diegoheer/bare-bucket-web:0.1.0
     ports:
       - "8080:8080"
     restart: unless-stopped
