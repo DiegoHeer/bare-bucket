@@ -1,0 +1,12 @@
+.git
+.github
+.claude
+.superpowers
+docs
+scripts
+target
+core/pkg
+core/pkg-node
+web/node_modules
+web/dist
+**/*.md
