@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/DiegoHeer/bare-bucket/compare/v0.1.0...v0.1.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* anchor release-please with last-release-sha ([13401c9](https://github.com/DiegoHeer/bare-bucket/commit/13401c981cf1322fa0c2c67136be7ae196d4e901))
+* anchor release-please with last-release-sha ([ca1e8af](https://github.com/DiegoHeer/bare-bucket/commit/ca1e8af836ae84a9fb815a7cb57f198ff8d0e7af))
+
 ## 0.1.0 (2026-07-28)
 
 
