@@ -63,7 +63,7 @@ ghcr.io/diegoheer/bare-bucket-web:1.0        # newest patch of a minor
 ```
 
 It serves the static app over plain HTTP on port 8080 as a non-root user —
-put your reverse proxy in front for TLS (see the http-vs-https notes above).
+put your reverse proxy in front for TLS (see the http-vs-https notes below).
 
 ```yaml
 services:

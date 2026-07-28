@@ -12,6 +12,14 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
+      # The v* trigger is a loose glob; without this guard a non-semver tag
+      # (e.g. v-test) would skip both semver tag patterns yet still push,
+      # silently clobbering `latest` with a non-release build.
+      - name: Validate release tag is semver
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::not a semver release tag: $GITHUB_REF_NAME"; exit 1; }
+
       - uses: actions/checkout@v4
 
       - uses: docker/setup-qemu-action@v3
