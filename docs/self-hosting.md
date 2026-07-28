@@ -52,6 +52,32 @@ any S3-compatible provider, because the endpoint, region, bucket, and
 credentials are all supplied at runtime through the connect screen (§8.1),
 not baked in at build time.
 
+## Run with Docker
+
+Each release publishes a multi-arch image (amd64/arm64):
+
+```
+ghcr.io/diegoheer/bare-bucket-web:latest     # newest release
+ghcr.io/diegoheer/bare-bucket-web:1.0.0      # exact version (recommended)
+ghcr.io/diegoheer/bare-bucket-web:1.0        # newest patch of a minor
+```
+
+It serves the static app over plain HTTP on port 8080 as a non-root user —
+put your reverse proxy in front for TLS (see the http-vs-https notes above).
+
+```yaml
+services:
+  bare-bucket:
+    image: ghcr.io/diegoheer/bare-bucket-web:1.0.0
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+```
+
+The image contains no credentials and needs no configuration — connection
+profiles live in your browser. Building locally instead: `docker build .`
+works from a bare checkout.
+
 ## Connecting: profile fields
 
 The connect screen (spec §7, §8.1) collects, per saved profile:
