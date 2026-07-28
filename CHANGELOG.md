@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.0.0](https://github.com/DiegoHeer/bare-bucket/compare/v0.1.0...v1.0.0) (2026-07-28)
+## 0.1.0 (2026-07-28)
 
 
 ### Features
